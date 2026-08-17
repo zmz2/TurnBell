@@ -1,0 +1,44 @@
+name: Publish TurnBell source
+
+on:
+  push:
+    branches:
+      - bootstrap-publish
+    paths:
+      - .turnbell-upload-v4/READY
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out staging branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify and extract staged source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 --decode .turnbell-upload-v4/chunk-000 > /tmp/turnbell-source.tar.xz
+          echo "2aa0b0e19aaa305478bcfcd3fd847b766c1749c6b43a987a107cbcd64880cf43  /tmp/turnbell-source.tar.xz" | sha256sum --check --strict
+          xz --test /tmp/turnbell-source.tar.xz
+          mkdir -p /tmp/turnbell-source
+          tar -xJf /tmp/turnbell-source.tar.xz -C /tmp/turnbell-source
+
+      - name: Publish source to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -B main origin/main
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a /tmp/turnbell-source/. .
+          git add -A
+          git commit -m "Publish TurnBell 1.5.0"
+          git push origin HEAD:main

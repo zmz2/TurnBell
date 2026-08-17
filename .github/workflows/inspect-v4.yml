@@ -1,0 +1,58 @@
+name: Inspect staged TurnBell v4 archive
+
+on:
+  push:
+    branches:
+      - publish-turnbell-1.5.0-final
+    paths:
+      - .turnbell-release-v4/CHECK
+
+permissions:
+  contents: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: publish-turnbell-1.5.0-final
+          fetch-depth: 0
+      - name: Reconstruct and inspect archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .turnbell-release-v4/chunk-* | tr -d '\r\n\t ' > /tmp/v4.b64
+          base64 --decode /tmp/v4.b64 > /tmp/v4.tar.xz
+          xz --test /tmp/v4.tar.xz
+          rm -rf /tmp/v4 && mkdir -p /tmp/v4
+          python3 - <<'PY'
+          from pathlib import PurePosixPath
+          import tarfile
+          with tarfile.open('/tmp/v4.tar.xz', 'r:xz') as tf:
+              for m in tf.getmembers():
+                  p = PurePosixPath(m.name)
+                  if p.is_absolute() or '..' in p.parts:
+                      raise SystemExit(f'unsafe member: {m.name}')
+              tf.extractall('/tmp/v4', filter='data')
+          PY
+          {
+            echo "base64-bytes=$(wc -c < /tmp/v4.b64)"
+            echo "archive-bytes=$(wc -c < /tmp/v4.tar.xz)"
+            echo "archive-sha256=$(sha256sum /tmp/v4.tar.xz | cut -d' ' -f1)"
+            echo "files=$(find /tmp/v4 -type f | wc -l)"
+            echo "total-file-bytes=$(find /tmp/v4 -type f -printf '%s\n' | awk '{s+=$1} END {print s+0}')"
+            echo
+            echo "FILES"
+            cd /tmp/v4
+            find . -type f -printf '%P\t%s\n' | sort
+            echo
+            echo "SHA256"
+            find . -type f -print0 | sort -z | xargs -0 sha256sum
+          } > "$GITHUB_WORKSPACE/.turnbell-release-v4/DIAGNOSTIC.txt"
+          cd "$GITHUB_WORKSPACE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .turnbell-release-v4/DIAGNOSTIC.txt
+          git commit -m "Record v4 archive diagnostic"
+          git push origin HEAD:publish-turnbell-1.5.0-final

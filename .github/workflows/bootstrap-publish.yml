@@ -1,0 +1,45 @@
+name: Bootstrap TurnBell source
+
+on:
+  push:
+    branches:
+      - bootstrap-publish
+    paths:
+      - .turnbell-upload/READY
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out bootstrap branch
+        uses: actions/checkout@v4
+        with:
+          ref: bootstrap-publish
+          fetch-depth: 0
+
+      - name: Verify and reconstruct source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd .turnbell-upload
+          sha256sum -c SHA256SUMS
+          cat chunk-* > /tmp/turnbell.tar.xz.b64
+          base64 --decode /tmp/turnbell.tar.xz.b64 > /tmp/turnbell.tar.xz
+          echo "ca42549341c3f4e09c391d7aaf63c11866f1c379dfd1f7ffa5e2cccfa524d535  /tmp/turnbell.tar.xz" | sha256sum -c -
+
+      - name: Publish exact source tree to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git checkout -B publish-main origin/main
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          tar -xJf /tmp/turnbell.tar.xz -C .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Publish TurnBell 1.5.0"
+          git push origin HEAD:main

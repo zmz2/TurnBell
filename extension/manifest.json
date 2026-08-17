@@ -1,0 +1,55 @@
+{
+  "manifest_version": 3,
+  "name": "TurnBell · AI 对话完成提醒",
+  "short_name": "TurnBell",
+  "version": "1.5.0",
+  "description": "本地、隐私优先：忽略刷新加载的历史对话，并兼容 ChatGPT Instant/极速回复完成提醒；无需 EXE。",
+  "minimum_chrome_version": "111",
+  "permissions": [
+    "notifications",
+    "storage",
+    "offscreen",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "action": {
+    "default_title": "TurnBell",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "assets/icons/icon-16.png",
+      "32": "assets/icons/icon-32.png",
+      "48": "assets/icons/icon-48.png",
+      "128": "assets/icons/icon-128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "src/detector-core.js",
+        "src/notification-core.js",
+        "src/sample-scheduler-core.js",
+        "src/bootstrap-core.js",
+        "src/dom-model-core.js",
+        "src/content.js"
+      ],
+      "run_at": "document_start",
+      "world": "ISOLATED"
+    }
+  ],
+  "icons": {
+    "16": "assets/icons/icon-16.png",
+    "32": "assets/icons/icon-32.png",
+    "48": "assets/icons/icon-48.png",
+    "128": "assets/icons/icon-128.png"
+  }
+}

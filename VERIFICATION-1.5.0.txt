@@ -1,0 +1,56 @@
+TurnBell 1.5.0 Verification Record
+Date: 2026-08-17
+
+Scope
+- Extension-only Microsoft Edge / Chromium release.
+- No EXE, native helper, local server, remote script, network interception,
+  fetch/XMLHttpRequest wrapping, or webRequest permission.
+- Runtime host access is limited to chatgpt.com and chat.openai.com.
+
+Source verification
+- node --test extension/tests/*.test.js
+  Result: PASS, 79 tests, 0 failures.
+- JavaScript syntax: node --check on every extension JavaScript file.
+  Result: PASS, 28 files.
+- python3 -m unittest discover -s scripts/tests -v
+  Result: PASS, 4 tests, 0 failures.
+- python3 -m py_compile scripts/*.py scripts/tests/*.py
+  Result: PASS.
+- git diff --check
+  Result: PASS.
+
+Regression coverage added for 1.5.0
+- Refreshed/hydrated historical conversations establish a silent baseline.
+- Enter-send explicitly arms a live turn; Shift+Enter and IME composition do not.
+- Regular reasoning turns notify only after final-render evidence.
+- Instant/fast turns that expose neither a generating state nor a final action row
+  require explicit user intent and about three seconds of stable changed text.
+- The Instant hidden-tab follow-up is scheduled through the extension service
+  worker for the full conservative quiet period instead of depending on a
+  throttled page timer.
+- Intermediate reasoning/progress content cannot use the actionless fallback.
+- Duplicate completion evidence is suppressed per turn.
+- Windows default sound uses a non-silent system notification and does not play
+  a bundled WAV; custom themes silence the system notification and play one
+  local WAV only.
+- Legacy bundled-sound settings migrate once to Windows default notification sound.
+
+Artifact verification
+The final release is built with scripts/build-all.sh and then checked with
+scripts/verify-artifacts.py. The verifier checks safe ZIP paths and CRC reads,
+Manifest V3 version/permissions/hosts, extension-only layout, absence of EXE
+and removed interception modules, byte-identical runtime files across archives,
+and SHA-256 checksum consistency.
+
+Environment and real-world test scope
+- Automated tests, syntax checks, and release packaging were executed in a Linux
+  build environment.
+- The project owner completed real-world functional testing on Windows with
+  Microsoft Edge, including normal and Instant/fast replies, background tabs,
+  switching to other applications, silent refresh hydration, duplicate
+  suppression, Windows notifications, Windows default notification sound, and
+  bundled custom sounds.
+- No real-world validation has been completed on macOS, Linux desktop browsers,
+  Google Chrome, Brave, Vivaldi, InPrivate, or organization-managed Edge.
+- Notification presentation and sound remain subject to Edge, Windows, Focus/
+  Do Not Disturb, per-app sound, and organization policy settings.

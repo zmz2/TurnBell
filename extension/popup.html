@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TurnBell</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="panel">
+    <header class="hero">
+      <img src="assets/icons/icon-48.png" width="42" height="42" alt="">
+      <div>
+        <h1>TurnBell</h1>
+        <p>AI 对话完成提醒 · 无需 EXE</p>
+      </div>
+      <label class="switch" title="总开关">
+        <input id="enabled" type="checkbox">
+        <span></span>
+      </label>
+    </header>
+
+    <section class="status-stack" aria-live="polite">
+      <div class="status-row">
+        <span id="monitorDot" class="dot"></span>
+        <span id="monitorStatus">正在检查 DOM 完成监听…</span>
+      </div>
+      <div class="status-row">
+        <span id="notificationDot" class="dot"></span>
+        <span id="notificationStatus">正在检查 Edge 通知权限…</span>
+        <button id="refreshStatus" class="link-button" type="button">刷新</button>
+      </div>
+      <p id="diagnosticStatus" class="profile-note">点击“测试系统通知”，这里会显示 Edge 是否真正接受了通知。</p>
+    </section>
+
+    <section class="settings">
+      <div class="mode-card">
+        <strong>保守完成判定</strong>
+        <span>只观察页面中已显示的 DOM 最终状态，不拦截通信、不读取响应流；每轮最多提醒一次，证据不足时宁可不提示。</span>
+      </div>
+
+      <label class="field">
+        <span>系统通知通道</span>
+        <select id="notificationBackend" aria-label="系统通知通道">
+          <option value="extension">Edge 扩展通知 API（官方通道）</option>
+          <option value="web">Web 通知兼容通道（实验）</option>
+        </select>
+        <small>Windows 没有显示 Edge 通知时，可切换到兼容通道后重新测试；两种方式都受 Edge 和 Windows 策略控制。</small>
+      </label>
+
+      <label class="row">
+        <span>
+          <strong>提示音</strong>
+          <small>默认跟随 Windows/Edge 通知声；也可改用扩展内置音效</small>
+        </span>
+        <input id="sound" type="checkbox">
+      </label>
+
+      <div class="field sound-picker">
+        <span>提示音样式</span>
+        <div class="inline-controls">
+          <select id="soundTheme" aria-label="提示音样式">
+            <option value="system">Windows 默认通知声（推荐）</option>
+            <option value="soft-chime">柔和双音</option>
+            <option value="warm-bell">温暖铃声</option>
+            <option value="glass">玻璃轻响</option>
+            <option value="gentle-pop">轻柔气泡</option>
+            <option value="digital">数字提示</option>
+          </select>
+          <button id="previewSound" class="secondary-inline" type="button">试听</button>
+        </div>
+      </div>
+
+      <label class="field volume-field">
+        <span>内置音效音量 <output id="soundVolumeValue">系统控制</output></span>
+        <input id="soundVolume" type="range" min="0" max="1" step="0.05">
+        <small>选择 Windows 默认通知声时，音量由 Windows 的系统声音设置控制，请用下方“测试通知”试听。</small>
+      </label>
+
+      <label class="row">
+        <span>
+          <strong>保留系统通知</strong>
+          <small>要求 Edge 让通知持续显示，直到你处理或系统收纳</small>
+        </span>
+        <input id="persistentNotification" type="checkbox">
+      </label>
+
+      <label class="row">
+        <span>
+          <strong>仅后台标签页提醒</strong>
+          <small>正在查看该对话时不弹出提醒</small>
+        </span>
+        <input id="backgroundOnly" type="checkbox">
+      </label>
+
+      <div class="two-column">
+        <label class="field compact">
+          <span>静默确认</span>
+          <div><input id="quietPeriodMs" type="number" min="200" max="10000" step="100"><em>毫秒</em></div>
+        </label>
+        <label class="field compact">
+          <span>最短生成</span>
+          <div><input id="minGenerationSeconds" type="number" min="0" max="600" step="0.5"><em>秒</em></div>
+        </label>
+      </div>
+    </section>
+
+    <div class="actions primary-actions">
+      <button id="testButton" class="primary" type="button">🔔 测试所选通知通道</button>
+      <button id="openButton" type="button">打开 ChatGPT</button>
+    </div>
+    <button id="openNotificationSettings" class="full-secondary" type="button">检查 Edge 系统通知策略</button>
+
+    <footer>
+      <span id="saveStatus">设置会自动保存</span>
+      <span>本地运行 · 无遥测</span>
+    </footer>
+  </main>
+
+  <script src="src/notification-core.js"></script>
+  <script src="src/popup.js"></script>
+</body>
+</html>

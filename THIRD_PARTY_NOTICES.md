@@ -6,6 +6,7 @@ TurnBell is an independent open-source project.
 
 - OpenAI, ChatGPT, and GPT are trademarks or registered trademarks of OpenAI.
 - Microsoft, Windows, and Microsoft Edge are trademarks or registered trademarks of Microsoft.
+- Google and Google Chrome are trademarks or registered trademarks of Google LLC.
 - Other product names and logos that may appear incidentally in documentation screenshots belong to their respective owners.
 
 These names are used only to identify compatibility, the tested environment, or the interface shown in installation instructions. Their use does not imply affiliation, endorsement, sponsorship, certification, or partnership.

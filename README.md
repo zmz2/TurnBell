@@ -1,14 +1,18 @@
 # TurnBell
 
-TurnBell 是一个本地、隐私优先的 Microsoft Edge 扩展：当 ChatGPT 的一轮新回复真正完成后，发送 Windows 系统通知、可选提示音，并在工具栏显示完成徽标。
+TurnBell 是一个本地、隐私优先的 Chromium 扩展：当 ChatGPT 的一轮新回复真正完成后，发送 Windows 系统通知、可选提示音，并在工具栏显示完成徽标。
 
 **无需 EXE，不启动本地端口，不更换 Edge 配置，不读取 Cookie，不上传对话。**
 
 > 当前版本：**1.5.0**  
-> 实机测试范围：**Windows + Microsoft Edge**。其他操作系统和浏览器尚未完成真实环境验证。
+> 实机测试范围：**Windows + Microsoft Edge / Google Chrome**。其他操作系统和浏览器尚未完成真实环境验证。
 
 <p align="center">
   <img src="docs/images/notification-demo.webp" alt="TurnBell 完成通知效果示意" width="900">
+</p>
+
+<p align="center">
+  <img src="docs/images/chrome-notification-demo.png" alt="TurnBell 在 Google Chrome 中的完成通知示例" width="900">
 </p>
 
 ## 功能
@@ -19,7 +23,7 @@ TurnBell 是一个本地、隐私优先的 Microsoft Edge 扩展：当 ChatGPT �
 - 忽略推理摘要、搜索进度、工具状态和仍在变化的中间内容。
 - 每个检测到的用户轮次最多提醒一次，抑制重复完成信号。
 - 支持 Windows 默认通知声和五种本地提示音。
-- 支持 Edge 扩展通知 API 与 Web Notification 兼容通道。
+- 支持 Edge / Chrome 扩展通知 API 与 Web Notification 兼容通道。
 - 全部处理在本机完成，无遥测、广告和远程 JavaScript。
 
 ## 快速安装
@@ -30,15 +34,23 @@ TurnBell 是一个本地、隐私优先的 Microsoft Edge 扩展：当 ChatGPT �
 
 不要直接在压缩包预览窗口中加载扩展。
 
-### 2. 打开 Edge 扩展管理页
+### 2. 打开浏览器扩展管理页
 
-在地址栏输入：
+如果你使用 **Microsoft Edge**，在地址栏输入：
 
 ```text
 edge://extensions/
 ```
 
+如果你使用 **Google Chrome**，在地址栏输入：
+
+```text
+chrome://extensions/
+```
+
 ### 3. 加载扩展
+
+#### Microsoft Edge
 
 1. 打开页面左下角的 **开发人员模式**；
 2. 点击右上角的 **加载解压缩的扩展**；
@@ -52,15 +64,29 @@ TurnBell-main\extension
   <img src="docs/images/edge-install.webp" alt="在 Microsoft Edge 中加载 TurnBell" width="950">
 </p>
 
+#### Google Chrome
+
+1. 打开页面右上角的 **开发者模式**；
+2. 点击左上角的 **加载未打包的扩展程序**；
+3. 选择解压目录中的：
+
+```text
+TurnBell-main\extension
+```
+
+<p align="center">
+  <img src="docs/images/chrome-install.png" alt="在 Google Chrome 中加载 TurnBell" width="1200">
+</p>
+
 ### 4. 开始使用
 
-1. 将 TurnBell 固定到 Edge 工具栏；
+1. 将 TurnBell 固定到浏览器工具栏；
 2. 刷新已经打开的 ChatGPT 标签页；
 3. 打开 TurnBell 弹窗；
 4. 点击 **测试所选通知通道**；
 5. 保持默认的 **Windows 默认通知声（推荐）**，或选择一个本地音效。
 
-更新旧版本时，在 `edge://extensions/` 中点击 TurnBell 卡片上的 **重新加载**，然后刷新所有 ChatGPT 标签页。请确保只安装一个 TurnBell 实例，避免重复提醒。
+更新旧版本时，在对应浏览器的扩展管理页中点击 TurnBell 卡片上的 **重新加载**，然后刷新所有 ChatGPT 标签页。请确保只安装一个 TurnBell 实例，避免重复提醒。
 
 ## 设置界面
 
@@ -81,7 +107,7 @@ TurnBell-main\extension
 
 ## 已完成的真实测试
 
-目前只在 **Windows + Microsoft Edge** 上进行了完整实机使用测试，并确认以下场景可用：
+目前已在 **Windows + Microsoft Edge** 与 **Windows + Google Chrome** 上进行了实机使用测试，并确认以下场景可用：
 
 - 普通推理强度完成提醒；
 - Instant / “极速”回复完成提醒；
@@ -90,6 +116,7 @@ TurnBell-main\extension
 - 刷新已有对话不提醒；
 - 连续多轮对话分别提醒；
 - Windows 系统通知；
+- Chrome 扩展系统通知；
 - Windows 默认通知声；
 - 自定义本地音效；
 - 每轮重复信号抑制。
@@ -97,9 +124,9 @@ TurnBell-main\extension
 尚未完成实机验证的环境包括：
 
 - macOS、Linux；
-- Google Chrome、Brave、Vivaldi 等其他 Chromium 浏览器；
-- InPrivate 模式；
-- 受学校、公司或组织策略管理的 Edge。
+- Brave、Vivaldi 等其他 Chromium 浏览器；
+- InPrivate / Chrome 无痕模式；
+- 受学校、公司或组织策略管理的 Edge / Chrome。
 
 Manifest 采用 Chromium 扩展标准，但这不等于上述环境已经验证可用。
 
@@ -200,3 +227,4 @@ docs/images/        README 使用的安装与界面图片
 代码及 TurnBell 原创图标、内置音效采用 [MIT License](LICENSE)。第三方名称、商标和文档截图说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 TurnBell 是非官方独立项目，与 OpenAI 或 Microsoft 无隶属、赞助、认证或合作关系。`ChatGPT`、`OpenAI`、`Microsoft`、`Windows` 和 `Microsoft Edge` 等名称仅用于准确说明兼容对象与测试环境，相关商标归各自权利人所有。
+TESTMARKER

@@ -1,0 +1,233 @@
+name: Publish TurnBell 1.5.0
+
+on:
+  push:
+    branches:
+      - publish-turnbell-1.5.0-final
+    paths:
+      - .turnbell-release-v3/READY
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: publish-turnbell-1.5.0
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: v1.5.0
+      EXPECTED_ARCHIVE_SHA256: 288577d072b90500368a6056dbde623be3ee47e1b6ac2ea195969e836fe1c3bc
+      EXPECTED_BASE64_BYTES: "1128860"
+      TEMP_BRANCH: publish-turnbell-1.5.0-final
+    steps:
+      - name: Check out staged publication data
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TEMP_BRANCH }}
+          fetch-depth: 0
+
+      - name: Reconstruct and verify the uploaded source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .turnbell-release-v3/chunk-* > /tmp/turnbell-source.tar.xz.b64
+          test "$(wc -c < /tmp/turnbell-source.tar.xz.b64)" -eq "$EXPECTED_BASE64_BYTES"
+          base64 --decode /tmp/turnbell-source.tar.xz.b64 > /tmp/turnbell-source.tar.xz
+          echo "$EXPECTED_ARCHIVE_SHA256  /tmp/turnbell-source.tar.xz" | sha256sum --check --strict
+          xz --test /tmp/turnbell-source.tar.xz
+          rm -rf /tmp/turnbell-source
+          mkdir -p /tmp/turnbell-source
+          tar -xJf /tmp/turnbell-source.tar.xz -C /tmp/turnbell-source
+          test -f /tmp/turnbell-source/README.md
+          test -f /tmp/turnbell-source/LICENSE
+          test -f /tmp/turnbell-source/PRIVACY.md
+          test -f /tmp/turnbell-source/SECURITY.md
+          test -f /tmp/turnbell-source/THIRD_PARTY_NOTICES.md
+          test -f /tmp/turnbell-source/extension/manifest.json
+          test -f /tmp/turnbell-source/docs/images/edge-install.webp
+          test -f /tmp/turnbell-source/docs/images/chrome-install.png
+          test -f /tmp/turnbell-source/docs/images/notification-demo.webp
+          test -f /tmp/turnbell-source/docs/images/chrome-notification-demo.png
+          test -f /tmp/turnbell-source/docs/images/settings-overview.webp
+          test -f /tmp/turnbell-source/docs/images/settings-advanced.webp
+          test ! -e /tmp/turnbell-source/.git
+          test ! -e /tmp/turnbell-source/.turnbell-release
+          test ! -e /tmp/turnbell-source/.turnbell-release-v3
+          test ! -e /tmp/turnbell-source/scripts/__pycache__
+          test "$(node -p "require('/tmp/turnbell-source/extension/manifest.json').version")" = "1.5.0"
+
+      - name: Run automated tests and build release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/turnbell-source
+          node --test extension/tests/*.test.js
+          find extension -name '*.js' -print0 | xargs -0 -n1 node --check
+          python3 -m unittest discover -s scripts/tests -v
+          python3 -m py_compile scripts/*.py scripts/tests/*.py
+          ./scripts/build-all.sh
+          python3 scripts/verify-artifacts.py
+          find scripts -type d -name __pycache__ -prune -exec rm -rf {} +
+          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+          test -f dist/TurnBell-1.5.0-extension.zip
+          test -f dist/TurnBell-1.5.0-Edge-Only.zip
+          test -f dist/TurnBell-1.5.0-project.zip
+          test -f dist/SHA256SUMS.txt
+          ! find . -type f \( -iname '*.exe' -o -iname '*.dll' -o -iname '*.msi' \) -print -quit | grep -q .
+          find . -type f ! -path './dist/*' -print0 | sort -z | xargs -0 sha256sum > /tmp/turnbell-source.sha256
+
+      - name: Publish exact verified project tree to main
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git checkout -B turnbell-publish-main origin/main
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a /tmp/turnbell-source/. .
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            PUBLISHED_SHA="$(git rev-parse HEAD)"
+          else
+            git commit -m "Publish TurnBell 1.5.0"
+            git push origin HEAD:main
+            PUBLISHED_SHA="$(git rev-parse HEAD)"
+          fi
+          echo "published_sha=$PUBLISHED_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Verify public main and README image files
+        shell: bash
+        run: |
+          set -euo pipefail
+          PUBLISHED_SHA="${{ steps.publish.outputs.published_sha }}"
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$PUBLISHED_SHA"
+          rm -rf /tmp/turnbell-main
+          git worktree add --detach /tmp/turnbell-main origin/main
+          cd /tmp/turnbell-main
+          test -f README.md
+          test -f extension/manifest.json
+          test "$(node -p "require('./extension/manifest.json').version")" = "1.5.0"
+          test ! -e .turnbell-release
+          test ! -e .turnbell-release-v3
+          test ! -e .github/workflows/publish-final.yml
+          test ! -e .github/workflows/publish-final-v2.yml
+          sha256sum -c /tmp/turnbell-source.sha256
+          node --test extension/tests/*.test.js
+          find extension -name '*.js' -print0 | xargs -0 -n1 node --check
+          python3 -m unittest discover -s scripts/tests -v
+          python3 scripts/verify-artifacts.py
+          for image in \
+            docs/images/edge-install.webp \
+            docs/images/chrome-install.png \
+            docs/images/notification-demo.webp \
+            docs/images/chrome-notification-demo.png \
+            docs/images/settings-overview.webp \
+            docs/images/settings-advanced.webp; do
+            grep -Fq "$image" README.md
+            curl --fail --silent --show-error --location \
+              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$PUBLISHED_SHA/$image" \
+              --output "/tmp/$(basename "$image")"
+            test -s "/tmp/$(basename "$image")"
+          done
+          curl --fail --silent --show-error --location \
+            "https://codeload.github.com/$GITHUB_REPOSITORY/zip/refs/heads/main" \
+            --output /tmp/TurnBell-main.zip
+          unzip -t /tmp/TurnBell-main.zip
+          unzip -Z1 /tmp/TurnBell-main.zip | grep -Fx 'TurnBell-main/extension/manifest.json'
+          git worktree remove /tmp/turnbell-main
+
+      - name: Create tag and GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          PUBLISHED_SHA="${{ steps.publish.outputs.published_sha }}"
+          git fetch --tags origin
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$PUBLISHED_SHA"
+          else
+            git tag -a "$RELEASE_TAG" "$PUBLISHED_SHA" -m "TurnBell 1.5.0"
+            git push origin "refs/tags/$RELEASE_TAG"
+          fi
+          cat > /tmp/release-notes.md <<'EOF'
+          ## 主要功能
+
+          - ChatGPT 回复完成后发送系统通知；
+          - 已在 Windows + Microsoft Edge 和 Windows + Google Chrome 上完成实机测试；
+          - 支持 Instant / 极速模式；
+          - 切换标签页或 Windows 应用后仍可提醒；
+          - 刷新历史对话不误报；
+          - 每轮至多提醒一次；
+          - 支持 Windows 默认通知声和可选本地音效；
+          - 无需 EXE，不启动本地端口。
+
+          ## 隐私
+
+          - 仅进行本地 DOM 观察；
+          - 不读取 Cookie、密码、Token 或账户凭据；
+          - 不上传回答正文；
+          - 不包装或拦截 `fetch`、`XMLHttpRequest`，不解析网络响应流；
+          - 不运行本地服务；
+          - 无遥测、广告和远程 JavaScript。
+
+          ## 已测试环境
+
+          - Windows + Microsoft Edge
+          - Windows + Google Chrome
+
+          ## 未验证环境
+
+          - macOS
+          - Linux
+          - Brave、Vivaldi 等其他 Chromium 浏览器
+          - Edge InPrivate / Chrome 无痕模式
+          - 受学校、公司或组织策略管理的浏览器环境
+
+          ## 下载说明
+
+          - `TurnBell-1.5.0-extension.zip`：独立扩展包，解压后在 Edge 或 Chrome 的扩展管理页加载。
+          - `TurnBell-1.5.0-project.zip`：完整项目、文档和测试包，包含 Edge 与 Chrome 安装说明。
+          - `TurnBell-1.5.0-Edge-Only.zip`：保留的 Edge 便捷安装包。
+          - `SHA256SUMS.txt`：发布资产 SHA-256 校验值。
+
+          TurnBell 是一个非官方、独立的开源项目，与 OpenAI、Microsoft 或 Google 不存在隶属、赞助、认证、合作或背书关系。
+          EOF
+          cd /tmp/turnbell-source
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "TurnBell 1.5.0" --notes-file /tmp/release-notes.md
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+              dist/TurnBell-1.5.0-extension.zip \
+              dist/TurnBell-1.5.0-project.zip \
+              dist/TurnBell-1.5.0-Edge-Only.zip \
+              dist/SHA256SUMS.txt
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "TurnBell 1.5.0" --notes-file /tmp/release-notes.md \
+              --target "$PUBLISHED_SHA" \
+              dist/TurnBell-1.5.0-extension.zip \
+              dist/TurnBell-1.5.0-project.zip \
+              dist/TurnBell-1.5.0-Edge-Only.zip \
+              dist/SHA256SUMS.txt
+          fi
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)" = "$RELEASE_TAG"
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')" -eq 4
+
+      - name: Remove obsolete publication branches
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh pr close 1 --repo "$GITHUB_REPOSITORY" --comment "TurnBell 1.5.0 has been published and verified on main; the temporary bootstrap PR is obsolete." || true
+          git push origin --delete bootstrap-publish || true
+          git push origin --delete publish-final || true
+          git push origin --delete "$TEMP_BRANCH" || true

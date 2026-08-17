@@ -1,0 +1,52 @@
+name: Publish TurnBell 1.5.0 to main
+
+on:
+  push:
+    branches:
+      - publish-final
+    paths:
+      - .turnbell-release/READY
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out staging branch
+        uses: actions/checkout@v4
+        with:
+          ref: publish-final
+          fetch-depth: 0
+
+      - name: Verify staged source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .turnbell-release/chunk-* | tr -d '\r\n\t ' > /tmp/turnbell.tar.xz.b64
+          base64 --decode /tmp/turnbell.tar.xz.b64 > /tmp/turnbell.tar.xz
+          echo "a7ad6bd550b5df81bfc33233a4e6c447cf959328bc74134af2095f6b97d3d2bf  /tmp/turnbell.tar.xz" | sha256sum --check --strict
+          xz --test /tmp/turnbell.tar.xz
+          mkdir -p /tmp/turnbell-source
+          tar -xJf /tmp/turnbell.tar.xz -C /tmp/turnbell-source
+          test -f /tmp/turnbell-source/extension/manifest.json
+          test -f /tmp/turnbell-source/README.md
+          test -f /tmp/turnbell-source/docs/images/chrome-install.webp
+          test -f /tmp/turnbell-source/docs/images/edge-install.webp
+
+      - name: Publish exact source tree to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git checkout -B publish-main origin/main
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a /tmp/turnbell-source/. .
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          find . -type f -name '*.pyc' -delete
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Publish TurnBell 1.5.0"
+          git push origin HEAD:main

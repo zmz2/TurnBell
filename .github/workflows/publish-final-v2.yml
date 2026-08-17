@@ -1,0 +1,94 @@
+name: Finalize TurnBell publication
+
+on:
+  push:
+    branches:
+      - publish-final
+    paths:
+      - .turnbell-release/READY2
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  publish-and-verify:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out staging branch
+        uses: actions/checkout@v4
+        with:
+          ref: publish-final
+          fetch-depth: 0
+
+      - name: Reconstruct and verify the exact source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .turnbell-release/chunk-* | tr -d '\r\n\t ' > /tmp/turnbell.tar.xz.b64
+          test "$(wc -c < /tmp/turnbell.tar.xz.b64)" -eq 616912
+          base64 --decode /tmp/turnbell.tar.xz.b64 > /tmp/turnbell.tar.xz
+          echo "a7ad6bd550b5df81bfc33233a4e6c447cf959328bc74134af2095f6b97d3d2bf  /tmp/turnbell.tar.xz" | sha256sum --check --strict
+          xz --test /tmp/turnbell.tar.xz
+          rm -rf /tmp/turnbell-source
+          mkdir -p /tmp/turnbell-source
+          tar -xJf /tmp/turnbell.tar.xz -C /tmp/turnbell-source
+          test -f /tmp/turnbell-source/README.md
+          test -f /tmp/turnbell-source/extension/manifest.json
+          test -f /tmp/turnbell-source/docs/images/edge-install.webp
+          test -f /tmp/turnbell-source/docs/images/chrome-install.webp
+
+      - name: Run project verification before publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/turnbell-source
+          node --test extension/tests/*.test.js
+          find extension -name '*.js' -print0 | xargs -0 -n1 node --check
+          python3 -m unittest discover -s scripts/tests -v
+          python3 -m py_compile scripts/*.py scripts/tests/*.py
+
+      - name: Publish the verified source tree to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git checkout -B publish-main origin/main
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a /tmp/turnbell-source/. .
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          find . -type f -name '*.pyc' -delete
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish TurnBell 1.5.0"
+            git push origin HEAD:main
+          fi
+
+      - name: Verify the public main branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          rm -rf /tmp/turnbell-main
+          git worktree add --detach /tmp/turnbell-main origin/main
+          cd /tmp/turnbell-main
+          test -f README.md
+          test -f extension/manifest.json
+          test -f docs/images/edge-install.webp
+          test -f docs/images/chrome-install.webp
+          test ! -e .turnbell-release
+          node --test extension/tests/*.test.js
+          python3 -m unittest discover -s scripts/tests -v
+          git worktree remove /tmp/turnbell-main
+
+      - name: Close obsolete pull request and delete temporary branches
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh pr close 1 --repo "$GITHUB_REPOSITORY" --comment "TurnBell 1.5.0 has been published and verified directly on main; this temporary bootstrap PR is obsolete." || true
+          git push origin --delete bootstrap-publish || true
+          git push origin --delete publish-final || true

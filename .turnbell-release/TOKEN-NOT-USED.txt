@@ -1,0 +1,1 @@
+No access token is stored or required by the repository contents.

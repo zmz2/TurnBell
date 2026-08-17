@@ -1,46 +1,73 @@
-name: Finalize TurnBell publication
+name: Publish TurnBell 1.5.0 once
 
 on:
   push:
     branches:
-      - publish-final
+      - publish-run-1.5.0
     paths:
-      - .turnbell-release/READY2
+      - .turnbell-release-v5/READY
 
 permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: turnbell-1.5.0-publication
+  cancel-in-progress: false
+
 jobs:
-  publish-and-verify:
+  publish:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Check out staging branch
+      - name: Check out the authenticated staging branch
         uses: actions/checkout@v4
         with:
-          ref: publish-final
+          ref: publish-run-1.5.0
           fetch-depth: 0
 
-      - name: Reconstruct and verify the exact source archive
+      - name: Reconstruct and authenticate the uploaded source archive
         shell: bash
         run: |
           set -euo pipefail
-          cat .turnbell-release/chunk-* | tr -d '\r\n\t ' > /tmp/turnbell.tar.xz.b64
-          test "$(wc -c < /tmp/turnbell.tar.xz.b64)" -eq 616912
-          base64 --decode /tmp/turnbell.tar.xz.b64 > /tmp/turnbell.tar.xz
-          echo "a7ad6bd550b5df81bfc33233a4e6c447cf959328bc74134af2095f6b97d3d2bf  /tmp/turnbell.tar.xz" | sha256sum --check --strict
-          xz --test /tmp/turnbell.tar.xz
+          cat .turnbell-release-v5/chunk-* | tr -d '\r\n\t ' > /tmp/turnbell-source.tar.xz.b64
+          test "$(wc -c < /tmp/turnbell-source.tar.xz.b64)" -eq 1125688
+          base64 --decode /tmp/turnbell-source.tar.xz.b64 > /tmp/turnbell-source.tar.xz
+          test "$(wc -c < /tmp/turnbell-source.tar.xz)" -eq 844264
+          echo "6138f424908ef2c3c64b22914f6f8fb248125f75c301b77377f90cf44832a9e6  /tmp/turnbell-source.tar.xz" | sha256sum --check --strict
+          xz --test /tmp/turnbell-source.tar.xz
           rm -rf /tmp/turnbell-source
           mkdir -p /tmp/turnbell-source
-          tar -xJf /tmp/turnbell.tar.xz -C /tmp/turnbell-source
+          tar -xJf /tmp/turnbell-source.tar.xz -C /tmp/turnbell-source
+
           test -f /tmp/turnbell-source/README.md
+          test -f /tmp/turnbell-source/LICENSE
+          test -f /tmp/turnbell-source/PRIVACY.md
+          test -f /tmp/turnbell-source/SECURITY.md
+          test -f /tmp/turnbell-source/THIRD_PARTY_NOTICES.md
           test -f /tmp/turnbell-source/extension/manifest.json
           test -f /tmp/turnbell-source/docs/images/edge-install.webp
-          test -f /tmp/turnbell-source/docs/images/chrome-install.webp
+          test -f /tmp/turnbell-source/docs/images/chrome-install.png
+          test ! -e /tmp/turnbell-source/.git
+          test ! -e /tmp/turnbell-source/.github
+          test ! -e /tmp/turnbell-source/dist
+          test -z "$(find /tmp/turnbell-source -type d -name __pycache__ -print -quit)"
+          test -z "$(find /tmp/turnbell-source -type f \( -name '*.pyc' -o -iname '*.exe' -o -iname '*.msi' \) -print -quit)"
 
-      - name: Run project verification before publishing
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          manifest = json.loads(Path('/tmp/turnbell-source/extension/manifest.json').read_text(encoding='utf-8'))
+          assert manifest['manifest_version'] == 3
+          assert manifest['version'] == '1.5.0'
+          assert set(manifest.get('host_permissions', [])) == {
+              'https://chatgpt.com/*',
+              'https://chat.openai.com/*',
+          }
+          PY
+
+      - name: Run the complete automated verification suite
         shell: bash
         run: |
           set -euo pipefail
@@ -49,8 +76,20 @@ jobs:
           find extension -name '*.js' -print0 | xargs -0 -n1 node --check
           python3 -m unittest discover -s scripts/tests -v
           python3 -m py_compile scripts/*.py scripts/tests/*.py
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          find . -type f -name '*.pyc' -delete
+          chmod +x scripts/build-all.sh
+          ./scripts/build-all.sh
+          python3 scripts/verify-artifacts.py
+          test -f dist/TurnBell-1.5.0-extension.zip
+          test -f dist/TurnBell-1.5.0-Edge-Only.zip
+          test -f dist/TurnBell-1.5.0-project.zip
+          test -f dist/SHA256SUMS.txt
+          test -z "$(find . -type d -name __pycache__ -print -quit)"
+          test -z "$(find . -type f \( -name '*.pyc' -o -iname '*.exe' -o -iname '*.msi' \) -print -quit)"
 
-      - name: Publish the verified source tree to main
+      - name: Publish the verified project directly to main
+        id: publish_main
         shell: bash
         run: |
           set -euo pipefail
@@ -60,15 +99,101 @@ jobs:
           cp -a /tmp/turnbell-source/. .
           find . -type d -name __pycache__ -prune -exec rm -rf {} +
           find . -type f -name '*.pyc' -delete
+
+          test ! -e .github
+          test -z "$(find . -maxdepth 1 -type d -name '.turnbell-release*' -print -quit)"
+          test -z "$(find . -type f \( -iname '*.exe' -o -iname '*.msi' \) -print -quit)"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          if ! git diff --cached --quiet; then
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            published_sha="$(git rev-parse HEAD)"
+          else
             git commit -m "Publish TurnBell 1.5.0"
             git push origin HEAD:main
+            published_sha="$(git rev-parse HEAD)"
+          fi
+          echo "sha=${published_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Create the v1.5.0 release and upload clean assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          published_sha="${{ steps.publish_main.outputs.sha }}"
+          if gh release view v1.5.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete v1.5.0 --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          elif git ls-remote --tags origin refs/tags/v1.5.0 | grep -q .; then
+            git push origin :refs/tags/v1.5.0
           fi
 
-      - name: Verify the public main branch
+          cat > /tmp/release-notes.md <<'EOF'
+          ## 主要功能
+
+          - ChatGPT 回复真正完成后发送 Windows 系统通知
+          - 已在 Microsoft Edge 与 Google Chrome 上完成实机测试
+          - 支持 ChatGPT Instant / 极速回复
+          - 切换标签页或 Windows 应用后仍可提醒
+          - 刷新历史对话保持静默
+          - 每轮至多提醒一次，并抑制重复完成信号
+          - 支持 Windows 默认通知声和可选本地音效
+          - 无需 EXE、无需本地端口或后台服务
+
+          ## 隐私
+
+          - 仅在浏览器本地观察页面 DOM 状态
+          - 不读取 Cookie、密码、Token 或账户凭据
+          - 不上传对话或助手回答正文
+          - 不拦截 fetch、XMLHttpRequest 或网络响应流
+          - 不使用 webRequest
+          - 无遥测、广告、混淆或远程 JavaScript
+
+          ## 已完成实机测试
+
+          - Windows + Microsoft Edge
+          - Windows + Google Chrome
+
+          ## 尚未实机验证
+
+          - macOS
+          - Linux
+          - Brave、Vivaldi 等其他 Chromium 浏览器
+          - Edge InPrivate
+          - Chrome 无痕模式
+          - 受学校、公司或组织策略管理的浏览器环境
+
+          TurnBell 是非官方、独立的开源项目，与 OpenAI、Microsoft 或 Google 不存在隶属、赞助、认证、合作或背书关系。
+          EOF
+
+          gh release create v1.5.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$published_sha" \
+            --title "TurnBell 1.5.0" \
+            --notes-file /tmp/release-notes.md \
+            /tmp/turnbell-source/dist/TurnBell-1.5.0-extension.zip \
+            /tmp/turnbell-source/dist/TurnBell-1.5.0-Edge-Only.zip \
+            /tmp/turnbell-source/dist/TurnBell-1.5.0-project.zip \
+            /tmp/turnbell-source/dist/SHA256SUMS.txt
+
+      - name: Apply repository description and topics when permitted
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh repo edit "$GITHUB_REPOSITORY" \
+            --description "Privacy-first completion notifications for ChatGPT on Microsoft Edge and Google Chrome." \
+            --add-topic browser-extension \
+            --add-topic chrome-extension \
+            --add-topic edge-extension \
+            --add-topic chromium-extension \
+            --add-topic manifest-v3 \
+            --add-topic chatgpt \
+            --add-topic notifications \
+            --add-topic windows \
+            --add-topic privacy \
+            --add-topic productivity || true
+
+      - name: Verify the public main branch, README images, archive and release
         shell: bash
         run: |
           set -euo pipefail
@@ -76,19 +201,77 @@ jobs:
           rm -rf /tmp/turnbell-main
           git worktree add --detach /tmp/turnbell-main origin/main
           cd /tmp/turnbell-main
+
           test -f README.md
+          test -f LICENSE
+          test -f PRIVACY.md
+          test -f SECURITY.md
+          test -f THIRD_PARTY_NOTICES.md
           test -f extension/manifest.json
-          test -f docs/images/edge-install.webp
-          test -f docs/images/chrome-install.webp
-          test ! -e .turnbell-release
+          test ! -e .github
+          test -z "$(find . -maxdepth 1 -type d -name '.turnbell-release*' -print -quit)"
+          test -z "$(find . -type d -name __pycache__ -print -quit)"
+          test -z "$(find . -type f \( -name '*.pyc' -o -iname '*.exe' -o -iname '*.msi' \) -print -quit)"
+
           node --test extension/tests/*.test.js
+          find extension -name '*.js' -print0 | xargs -0 -n1 node --check
           python3 -m unittest discover -s scripts/tests -v
+          python3 scripts/verify-artifacts.py
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          find . -type f -name '*.pyc' -delete
+
+          image_paths=(
+            docs/images/notification-demo.webp
+            docs/images/chrome-notification-demo.png
+            docs/images/edge-install.webp
+            docs/images/chrome-install.png
+            docs/images/settings-overview.webp
+            docs/images/settings-advanced.webp
+          )
+          for image_path in "${image_paths[@]}"; do
+            test -s "$image_path"
+            gh api "repos/${GITHUB_REPOSITORY}/contents/${image_path}?ref=main" >/dev/null
+          done
+
+          gh api -H "Accept: application/vnd.github.html+json" "repos/${GITHUB_REPOSITORY}/readme?ref=main" > /tmp/turnbell-readme.html
+          for image_name in notification-demo.webp chrome-notification-demo.png edge-install.webp chrome-install.png settings-overview.webp settings-advanced.webp; do
+            grep -Fq "$image_name" /tmp/turnbell-readme.html
+          done
+
+          rm -rf /tmp/turnbell-main-zip /tmp/turnbell-main.zip
+          curl --fail --location --retry 5 --retry-all-errors \
+            "https://github.com/${GITHUB_REPOSITORY}/archive/refs/heads/main.zip" \
+            --output /tmp/turnbell-main.zip
+          unzip -t /tmp/turnbell-main.zip >/dev/null
+          mkdir -p /tmp/turnbell-main-zip
+          unzip -q /tmp/turnbell-main.zip -d /tmp/turnbell-main-zip
+          test -n "$(find /tmp/turnbell-main-zip -path '*/extension/manifest.json' -print -quit)"
+
+          release_assets="$(gh release view v1.5.0 --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          for asset in TurnBell-1.5.0-extension.zip TurnBell-1.5.0-Edge-Only.zip TurnBell-1.5.0-project.zip SHA256SUMS.txt; do
+            grep -Fxq "$asset" <<< "$release_assets"
+          done
+
           git worktree remove /tmp/turnbell-main
 
-      - name: Close obsolete pull request and delete temporary branches
+      - name: Close obsolete pull requests and delete every branch except main
         shell: bash
         run: |
           set -euo pipefail
-          gh pr close 1 --repo "$GITHUB_REPOSITORY" --comment "TurnBell 1.5.0 has been published and verified directly on main; this temporary bootstrap PR is obsolete." || true
-          git push origin --delete bootstrap-publish || true
-          git push origin --delete publish-final || true
+          while IFS= read -r pr_number; do
+            test -n "$pr_number" || continue
+            gh pr close "$pr_number" --repo "$GITHUB_REPOSITORY" --comment "TurnBell 1.5.0 has been published and verified directly on main; temporary publication branches are being removed." || true
+          done < <(gh pr list --repo "$GITHUB_REPOSITORY" --state open --json number --jq '.[].number')
+
+          while read -r _ ref; do
+            branch="${ref#refs/heads/}"
+            if [[ "$branch" != "main" ]]; then
+              git push origin --delete "$branch"
+            fi
+          done < <(git ls-remote --heads origin)
+
+          mapfile -t remaining_branches < <(git ls-remote --heads origin | awk '{sub("refs/heads/", "", $2); print $2}')
+          test "${#remaining_branches[@]}" -eq 1
+          test "${remaining_branches[0]}" = "main"
+          gh release view v1.5.0 --repo "$GITHUB_REPOSITORY" >/dev/null
+          git ls-remote --exit-code --tags origin refs/tags/v1.5.0 >/dev/null

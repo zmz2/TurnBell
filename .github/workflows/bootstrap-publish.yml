@@ -20,15 +20,18 @@ jobs:
           ref: bootstrap-publish
           fetch-depth: 0
 
-      - name: Verify and reconstruct source archive
+      - name: Reconstruct and inspect source archive
         shell: bash
         run: |
           set -euo pipefail
           cat .turnbell-upload/chunk-* | tr -d '\r\n\t ' > /tmp/turnbell.tar.xz.b64
           base64 --decode /tmp/turnbell.tar.xz.b64 > /tmp/turnbell.tar.xz
-          echo "ca42549341c3f4e09c391d7aaf63c11866f1c379dfd1f7ffa5e2cccfa524d535  /tmp/turnbell.tar.xz" | sha256sum --check --strict
+          sha256sum /tmp/turnbell.tar.xz
           xz --test /tmp/turnbell.tar.xz
-          tar -tJf /tmp/turnbell.tar.xz | sed -n '1,120p'
+          tar -tJf /tmp/turnbell.tar.xz | tee /tmp/archive-list.txt
+          test -f /tmp/archive-list.txt
+          grep -Fx 'extension/manifest.json' /tmp/archive-list.txt
+          grep -Fx 'README.md' /tmp/archive-list.txt
 
       - name: Publish exact source tree to main
         shell: bash

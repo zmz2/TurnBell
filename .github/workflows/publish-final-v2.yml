@@ -1,4 +1,4 @@
-name: Publish TurnBell 1.5.0 once
+name: Publish TurnBell 1.5.0 now
 
 on:
   push:
@@ -18,40 +18,48 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+      EXPECTED_B64_BYTES: "605724"
+      EXPECTED_ARCHIVE_BYTES: "454292"
+      EXPECTED_ARCHIVE_SHA256: "10c22c9fbd6722d031cdebac6c2eb97098da9c1cf265ed0e7fffe812b311a6ee"
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out staged publication data
+        uses: actions/checkout@v4
         with:
           ref: publish-run-1.5.0
           fetch-depth: 0
 
-      - name: Authenticate, extract, and restore the staged source
+      - name: Authenticate, extract, and restore the source
         shell: bash
         run: |
           set -euo pipefail
           command -v flac >/dev/null || { sudo apt-get update && sudo apt-get install -y flac; }
           command -v ffmpeg >/dev/null || { sudo apt-get update && sudo apt-get install -y ffmpeg; }
 
-          cat .turnbell-release-v5/chunk-* | tr -d '\r\n\t ' > /tmp/turnbell-source.tar.xz.b64
-          test "$(wc -c < /tmp/turnbell-source.tar.xz.b64)" -eq 605296
+          mapfile -t chunks < <(find .turnbell-release-v5 -maxdepth 1 -type f -name 'chunk-*' | sort)
+          test "${#chunks[@]}" -eq 13
+          cat "${chunks[@]}" | tr -d '\r\n\t ' > /tmp/turnbell-source.tar.xz.b64
+          test "$(wc -c < /tmp/turnbell-source.tar.xz.b64)" -eq "$EXPECTED_B64_BYTES"
           base64 --decode /tmp/turnbell-source.tar.xz.b64 > /tmp/turnbell-source.tar.xz
-          test "$(wc -c < /tmp/turnbell-source.tar.xz)" -eq 453972
-          echo "a93d87c44e7e55e1dcd46022ceff3dec06640e610bdb7d3f83cfe5e57992ceb3  /tmp/turnbell-source.tar.xz" | sha256sum -c --strict
+          test "$(wc -c < /tmp/turnbell-source.tar.xz)" -eq "$EXPECTED_ARCHIVE_BYTES"
+          echo "$EXPECTED_ARCHIVE_SHA256  /tmp/turnbell-source.tar.xz" | sha256sum -c --strict
           xz --test /tmp/turnbell-source.tar.xz
+
           rm -rf /tmp/turnbell-source
           mkdir -p /tmp/turnbell-source
-
           python3 - <<'PY'
           from pathlib import PurePosixPath
           import tarfile
+
           archive = "/tmp/turnbell-source.tar.xz"
           with tarfile.open(archive, "r:xz") as tf:
-              for member in tf.getmembers():
+              members = tf.getmembers()
+              for member in members:
                   path = PurePosixPath(member.name)
                   if path.is_absolute() or ".." in path.parts:
                       raise SystemExit(f"unsafe archive member: {member.name!r}")
                   if not (member.isfile() or member.isdir()):
                       raise SystemExit(f"unsupported archive member: {member.name!r}")
-              tf.extractall("/tmp/turnbell-source", filter="data")
+              tf.extractall("/tmp/turnbell-source", members=members, filter="data")
           PY
 
           cd /tmp/turnbell-source
@@ -80,8 +88,10 @@ jobs:
           sha256sum -c /tmp/turnbell-audio.sha256
 
           python3 - <<'PY'
-          import json, struct
+          import json
+          import struct
           from pathlib import Path
+
           manifest = json.loads(Path("extension/manifest.json").read_text(encoding="utf-8"))
           assert manifest["manifest_version"] == 3
           assert manifest["version"] == "1.5.0"
@@ -111,9 +121,9 @@ jobs:
           test ! -e dist
           test ! -e .turnbell-transport
           test -z "$(find . -type d -name __pycache__ -print -quit)"
-          test -z "$(find . -type f \( -name '*.pyc' -o -iname '*.exe' -o -iname '*.msi' \) -print -quit)"
+          test -z "$(find . -type f \( -name '*.pyc' -o -name '*.pyo' -o -iname '*.exe' -o -iname '*.msi' \) -print -quit)"
 
-      - name: Run tests and build verified release assets
+      - name: Run all tests and build clean release assets
         shell: bash
         run: |
           set -euo pipefail
@@ -123,7 +133,7 @@ jobs:
           python3 -m unittest discover -s scripts/tests -v
           python3 -m py_compile scripts/*.py scripts/tests/*.py
           find . -type d -name __pycache__ -prune -exec rm -rf {} +
-          find . -type f -name '*.pyc' -delete
+          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
           chmod +x scripts/build-all.sh
           ./scripts/build-all.sh
           python3 scripts/verify-artifacts.py
@@ -132,10 +142,10 @@ jobs:
           test -f dist/TurnBell-1.5.0-project.zip
           test -f dist/SHA256SUMS.txt
           test -z "$(find . -type d -name __pycache__ -print -quit)"
-          test -z "$(find . -type f \( -name '*.pyc' -o -iname '*.exe' -o -iname '*.msi' \) -print -quit)"
+          test -z "$(find . -type f \( -name '*.pyc' -o -name '*.pyo' -o -iname '*.exe' -o -iname '*.msi' \) -print -quit)"
 
-      - name: Publish the verified tree directly to main
-        id: main
+      - name: Publish the verified project directly to main
+        id: publish
         shell: bash
         run: |
           set -euo pipefail
@@ -144,7 +154,8 @@ jobs:
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           cp -a /tmp/turnbell-source/. .
           find . -type d -name __pycache__ -prune -exec rm -rf {} +
-          find . -type f -name '*.pyc' -delete
+          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+
           test ! -e .github
           test ! -e .turnbell-transport
           test -z "$(find . -maxdepth 1 -type d -name '.turnbell-release*' -print -quit)"
@@ -154,17 +165,20 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git diff --cached --check
-          if ! git diff --cached --quiet; then
+          if git diff --cached --quiet; then
+            published_sha="$(git rev-parse HEAD)"
+          else
             git commit -m "Publish TurnBell 1.5.0"
             git push origin HEAD:main
+            published_sha="$(git rev-parse HEAD)"
           fi
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "sha=$published_sha" >> "$GITHUB_OUTPUT"
 
-      - name: Create the v1.5.0 release
+      - name: Create tag and GitHub Release
         shell: bash
         run: |
           set -euo pipefail
-          published_sha="${{ steps.main.outputs.sha }}"
+          published_sha="${{ steps.publish.outputs.sha }}"
           if gh release view v1.5.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release delete v1.5.0 --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           elif git ls-remote --tags origin refs/tags/v1.5.0 | grep -q .; then
@@ -173,28 +187,37 @@ jobs:
 
           cat > /tmp/release-notes.md <<'EOF'
           ## 主要功能
+
           - ChatGPT 回复真正完成后发送 Windows 系统通知
           - 已在 Microsoft Edge 与 Google Chrome 上完成实机测试
-          - 支持 Instant / 极速回复、后台标签页与应用切换提醒
-          - 刷新历史对话保持静默，每轮至多提醒一次
+          - 支持 ChatGPT Instant / 极速回复
+          - 切换标签页或 Windows 应用后仍可提醒
+          - 刷新历史对话保持静默
+          - 每轮至多提醒一次，并抑制重复完成信号
           - 支持 Windows 默认通知声和可选本地音效
-          - 无需 EXE、本地端口或后台服务
+          - 无需 EXE、无需本地端口或后台服务
 
           ## 隐私
+
           - 仅在浏览器本地观察页面 DOM 状态
           - 不读取 Cookie、密码、Token 或账户凭据
           - 不上传对话或助手回答正文
           - 不拦截 fetch、XMLHttpRequest 或网络响应流
-          - 不使用 webRequest，无遥测和远程 JavaScript
+          - 不使用 webRequest
+          - 无遥测、广告、混淆或远程 JavaScript
 
           ## 已完成实机测试
+
           - Windows + Microsoft Edge
           - Windows + Google Chrome
 
           ## 尚未实机验证
-          - macOS、Linux
+
+          - macOS
+          - Linux
           - Brave、Vivaldi 等其他 Chromium 浏览器
-          - Edge InPrivate、Chrome 无痕模式
+          - Edge InPrivate
+          - Chrome 无痕模式
           - 受学校、公司或组织策略管理的浏览器环境
 
           TurnBell 是非官方、独立的开源项目，与 OpenAI、Microsoft 或 Google 不存在隶属、赞助、认证、合作或背书关系。
@@ -217,11 +240,11 @@ jobs:
             --add-topic manifest-v3 --add-topic chatgpt --add-topic notifications \
             --add-topic windows --add-topic privacy --add-topic productivity || true
 
-      - name: Verify the public result and remove every non-main branch
+      - name: Verify public main, README images, archive, and release
         shell: bash
         run: |
           set -euo pipefail
-          published_sha="${{ steps.main.outputs.sha }}"
+          published_sha="${{ steps.publish.outputs.sha }}"
           git fetch origin main
           test "$(git rev-parse origin/main)" = "$published_sha"
           rm -rf /tmp/turnbell-main
@@ -229,25 +252,33 @@ jobs:
           cd /tmp/turnbell-main
 
           test -f README.md
+          test -f LICENSE
+          test -f PRIVACY.md
+          test -f SECURITY.md
+          test -f THIRD_PARTY_NOTICES.md
           test -f extension/manifest.json
+          test "$(node -p "require('./extension/manifest.json').version")" = "1.5.0"
           test ! -e .github
           test ! -e .turnbell-transport
           test -z "$(find . -maxdepth 1 -type d -name '.turnbell-release*' -print -quit)"
           test -z "$(find . -type d -name __pycache__ -print -quit)"
-          test -z "$(find . -type f \( -name '*.pyc' -o -iname '*.exe' -o -iname '*.msi' \) -print -quit)"
+          test -z "$(find . -type f \( -name '*.pyc' -o -name '*.pyo' -o -iname '*.exe' -o -iname '*.msi' \) -print -quit)"
+
           node --test extension/tests/*.test.js
           find extension -name '*.js' -print0 | xargs -0 -n1 node --check
           python3 -m unittest discover -s scripts/tests -v
           python3 scripts/verify-artifacts.py
           find . -type d -name __pycache__ -prune -exec rm -rf {} +
-          find . -type f -name '*.pyc' -delete
+          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
           images=(notification-demo.webp chrome-notification-demo.png edge-install.webp chrome-install.png settings-overview.webp settings-advanced.webp)
           for name in "${images[@]}"; do
             path="docs/images/$name"
             test -s "$path"
+            grep -Fq "$path" README.md
             gh api "repos/${GITHUB_REPOSITORY}/contents/${path}?ref=main" >/dev/null
           done
+
           gh api -H "Accept: application/vnd.github.html+json" \
             "repos/${GITHUB_REPOSITORY}/readme?ref=main" > /tmp/turnbell-readme.html
           for name in "${images[@]}"; do grep -Fq "$name" /tmp/turnbell-readme.html; done
@@ -263,9 +294,14 @@ jobs:
             grep -Fxq "$asset" <<< "$assets"
           done
           test "$(gh release view v1.5.0 --repo "$GITHUB_REPOSITORY" --json targetCommitish --jq .targetCommitish)" = "$published_sha"
+
           cd "$GITHUB_WORKSPACE"
           git worktree remove /tmp/turnbell-main
 
+      - name: Close obsolete pull requests and delete every branch except main
+        shell: bash
+        run: |
+          set -euo pipefail
           while IFS= read -r number; do
             test -n "$number" || continue
             gh pr close "$number" --repo "$GITHUB_REPOSITORY" \
@@ -274,7 +310,9 @@ jobs:
 
           while read -r _ ref; do
             branch="${ref#refs/heads/}"
-            if [[ "$branch" != "main" ]]; then git push origin --delete "$branch"; fi
+            if [[ "$branch" != "main" ]]; then
+              git push origin --delete "$branch"
+            fi
           done < <(git ls-remote --heads origin)
 
           mapfile -t branches < <(git ls-remote --heads origin | awk '{sub("refs/heads/", "", $2); print $2}')

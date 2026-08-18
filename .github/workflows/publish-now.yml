@@ -1,0 +1,192 @@
+name: Publish TurnBell 1.5.0 now
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/publish-now.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: turnbell-1.5.0-direct-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the verified staging branch
+        uses: actions/checkout@v4
+        with:
+          ref: publish-final
+          fetch-depth: 0
+
+      - name: Reconstruct and verify the source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import base64
+          import lzma
+          from pathlib import Path
+
+          root = Path('.turnbell-release')
+          chunks = [root / f'chunk-{index:03d}' for index in range(13)]
+          missing = [str(path) for path in chunks if not path.is_file()]
+          if missing:
+              raise SystemExit(f'missing source chunks: {missing}')
+
+          for last_index in (11, 12):
+              encoded = ''.join(
+                  ''.join(path.read_text(encoding='utf-8').split())
+                  for path in chunks[: last_index + 1]
+              )
+              try:
+                  compressed = base64.b64decode(encoded, validate=True)
+                  lzma.decompress(compressed)
+              except Exception as exc:
+                  print(f'candidate chunk-000..chunk-{last_index:03d} rejected: {exc}')
+                  continue
+              Path('/tmp/turnbell-source.tar.xz').write_bytes(compressed)
+              print(f'selected chunk-000..chunk-{last_index:03d}')
+              break
+          else:
+              raise SystemExit('no complete staged XZ source stream was found')
+          PY
+
+          echo '838e585ded4707e1efe26f44b078eaadcbb5c2345fe787d62bdb2e08fc63081e  /tmp/turnbell-overlay.tar.gz' > /tmp/overlay.sha256
+          base64 --decode .turnbell-release/final-overlay.tar.gz.b64 > /tmp/turnbell-overlay.tar.gz
+          sha256sum --check --strict /tmp/overlay.sha256
+
+          rm -rf /tmp/turnbell-source /tmp/turnbell-overlay
+          mkdir -p /tmp/turnbell-source /tmp/turnbell-overlay
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path, PurePosixPath
+          import tarfile
+
+          def extract_safe(archive: Path, destination: Path, mode: str) -> None:
+              with tarfile.open(archive, mode) as bundle:
+                  members = bundle.getmembers()
+                  for member in members:
+                      path = PurePosixPath(member.name)
+                      if path.is_absolute() or '..' in path.parts:
+                          raise SystemExit(f'unsafe archive member: {member.name!r}')
+                      if not (member.isfile() or member.isdir()):
+                          raise SystemExit(f'unsupported archive member: {member.name!r}')
+                  bundle.extractall(destination, members=members, filter='data')
+
+          extract_safe(Path('/tmp/turnbell-source.tar.xz'), Path('/tmp/turnbell-source'), 'r:xz')
+          extract_safe(Path('/tmp/turnbell-overlay.tar.gz'), Path('/tmp/turnbell-overlay'), 'r:gz')
+          PY
+
+          test -d /tmp/turnbell-overlay/files
+          cp -a /tmp/turnbell-overlay/files/. /tmp/turnbell-source/
+
+          rm -rf /tmp/turnbell-source/.git /tmp/turnbell-source/dist
+          find /tmp/turnbell-source -type d -name __pycache__ -prune -exec rm -rf {} +
+          find /tmp/turnbell-source -type f -name '*.pyc' -delete
+          chmod 0755 /tmp/turnbell-source/scripts/build-all.sh
+
+          test -z "$(find /tmp/turnbell-source -type l -print -quit)"
+          cd /tmp/turnbell-source
+          find . -type f -printf '%P\n' | LC_ALL=C sort > /tmp/actual-files.txt
+          diff -u /tmp/turnbell-overlay/expected-files.txt /tmp/actual-files.txt
+          sha256sum --check --strict /tmp/turnbell-overlay/expected.sha256
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+
+          manifest = json.loads(Path('extension/manifest.json').read_text(encoding='utf-8'))
+          assert manifest['manifest_version'] == 3
+          assert manifest['version'] == '1.5.0'
+          assert set(manifest['permissions']) == {'notifications', 'storage', 'offscreen', 'scripting'}
+          assert set(manifest['host_permissions']) == {
+              'https://chatgpt.com/*',
+              'https://chat.openai.com/*',
+          }
+          print('Manifest verification passed.')
+          PY
+
+      - name: Run tests and build validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/turnbell-source
+          node --test extension/tests/*.test.js
+          while IFS= read -r -d '' file; do
+            node --check "$file"
+          done < <(find extension -name '*.js' -print0)
+          python3 -m unittest discover -s scripts/tests -v
+          python3 -m py_compile scripts/*.py scripts/tests/*.py
+          ./scripts/build-all.sh
+          python3 scripts/verify-artifacts.py --root . --version 1.5.0
+          (cd dist && sha256sum --check --strict SHA256SUMS.txt)
+
+      - name: Publish clean project tree to main
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git checkout -B turnbell-release-main origin/main
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a /tmp/turnbell-source/. .
+          rm -rf dist
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          find . -type f -name '*.pyc' -delete
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          if ! git diff --cached --quiet; then
+            git commit -m 'Publish TurnBell 1.5.0'
+            git push origin HEAD:main
+          fi
+          echo "main_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify public main and remove temporary branches
+        shell: bash
+        env:
+          MAIN_SHA: ${{ steps.publish.outputs.main_sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$MAIN_SHA"
+
+          rm -rf /tmp/turnbell-main
+          git worktree add --detach /tmp/turnbell-main origin/main
+          cd /tmp/turnbell-main
+          test -f README.md
+          test -f extension/manifest.json
+          test -f docs/images/edge-install.webp
+          test -f docs/images/chrome-install.webp
+          test ! -e .github
+          test ! -e .turnbell-release
+          test ! -e dist
+          find . -type f ! -path './.git/*' -printf '%P\n' | LC_ALL=C sort > /tmp/public-files.txt
+          diff -u /tmp/turnbell-overlay/expected-files.txt /tmp/public-files.txt
+          sha256sum --check --strict /tmp/turnbell-overlay/expected.sha256
+          node --test extension/tests/*.test.js
+          python3 -m unittest discover -s scripts/tests -v
+          cd "$GITHUB_WORKSPACE"
+          git worktree remove /tmp/turnbell-main
+
+          for branch in \
+            agent/publish-turnbell-1.5.0 \
+            bootstrap-publish \
+            publish-final \
+            publish-run-1.5.0 \
+            publish-turnbell-1.5.0-final; do
+            git push origin --delete "$branch" || true
+          done

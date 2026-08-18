@@ -16,17 +16,37 @@ jobs:
   publish:
     if: github.event.issue.title == 'TurnBell direct publish 1.5.0'
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TRIGGER_ISSUE: ${{ github.event.issue.number }}
     steps:
+      - name: Mark publication started
+        run: gh issue comment "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" --body 'Direct publication started.'
+
       - name: Check out staged project
         uses: actions/checkout@v4
         with:
           ref: publish-final
           fetch-depth: 0
 
-      - name: Reconstruct uploaded project
+      - name: Reconstruct and push uploaded project
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          exec > >(tee /tmp/turnbell-publish.log) 2>&1
+          report_failure() {
+            status=$?
+            {
+              echo 'Direct publication failed. Last log lines:'
+              echo '```'
+              tail -n 40 /tmp/turnbell-publish.log || true
+              echo '```'
+            } > /tmp/turnbell-failure.md
+            gh issue comment "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" --body-file /tmp/turnbell-failure.md || true
+            exit "$status"
+          }
+          trap report_failure ERR
+
           python3 - <<'PY'
           import base64
           import lzma
@@ -65,10 +85,6 @@ jobs:
           find /tmp/turnbell-source -type d -name __pycache__ -prune -exec rm -rf {} +
           find /tmp/turnbell-source -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
-      - name: Push directly to main
-        shell: bash
-        run: |
-          set -euo pipefail
           git fetch origin main
           git checkout -B turnbell-direct-main origin/main
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
@@ -91,7 +107,5 @@ jobs:
             git push origin --delete "$branch" || true
           done
 
-      - name: Close publication trigger
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh issue close "${{ github.event.issue.number }}" --repo "$GITHUB_REPOSITORY" --comment 'TurnBell 1.5.0 was published directly to main.'
+          trap - ERR
+          gh issue close "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" --comment 'TurnBell 1.5.0 was published directly to main.'

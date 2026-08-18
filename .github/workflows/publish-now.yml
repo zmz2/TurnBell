@@ -1,4 +1,4 @@
-name: Publish TurnBell 1.5.0 directly
+name: Recover and publish TurnBell 1.5.0
 
 on:
   issues:
@@ -9,12 +9,12 @@ permissions:
   issues: write
 
 concurrency:
-  group: turnbell-publish-main-final
+  group: turnbell-recover-publish-main
   cancel-in-progress: false
 
 jobs:
   publish:
-    if: github.event.issue.title == 'Publish TurnBell 1.5.0 now v2'
+    if: github.event.issue.title == 'Recover and publish TurnBell 1.5.0'
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
@@ -26,7 +26,7 @@ jobs:
           ref: publish-final
           fetch-depth: 0
 
-      - name: Reconstruct and push main
+      - name: Recover source and push main
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -37,7 +37,7 @@ jobs:
             {
               echo 'Direct publication failed. Last log lines:'
               echo '```text'
-              tail -n 80 /tmp/turnbell-publish.log || true
+              tail -n 120 /tmp/turnbell-publish.log || true
               echo '```'
             } > /tmp/turnbell-failure.md
             gh issue comment "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" --body-file /tmp/turnbell-failure.md || true
@@ -45,7 +45,7 @@ jobs:
           }
           trap report_failure ERR
 
-          gh issue comment "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" --body 'Direct publication started.'
+          gh issue comment "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" --body 'Recovering the staged source and publishing directly.'
 
           rm -rf /tmp/turnbell-source /tmp/turnbell-overlay
           mkdir -p /tmp/turnbell-source /tmp/turnbell-overlay
@@ -58,12 +58,22 @@ jobs:
           root = Path('.turnbell-release')
           encoded = ''.join(
               ''.join((root / f'chunk-{index:03d}').read_text(encoding='utf-8').split())
-              for index in range(13)
+              for index in range(12)
           )
           encoded += '=' * (-len(encoded) % 4)
-          archive = base64.b64decode(encoded, validate=True)
-          lzma.decompress(archive)
-          Path('/tmp/turnbell-source.tar.xz').write_bytes(archive)
+          data = base64.b64decode(encoded, validate=True)
+
+          decoder = lzma.LZMADecompressor()
+          output = bytearray()
+          error_at = None
+          for position, value in enumerate(data):
+              try:
+                  output.extend(decoder.decompress(bytes((value,))))
+              except lzma.LZMAError:
+                  error_at = position
+                  break
+          Path('/tmp/turnbell-source.partial.tar').write_bytes(output)
+          print(f'compressed_bytes={len(data)} recovered_tar_bytes={len(output)} error_at={error_at} eof={decoder.eof}')
 
           overlay_encoded = ''.join(
               (root / 'final-overlay.tar.gz.b64').read_text(encoding='utf-8').split()
@@ -74,9 +84,9 @@ jobs:
           )
           PY
 
-          xz --test /tmp/turnbell-source.tar.xz
+          tar -xf /tmp/turnbell-source.partial.tar -C /tmp/turnbell-source --ignore-zeros 2>/tmp/tar-recovery-error.log || true
+          cat /tmp/tar-recovery-error.log || true
           gzip --test /tmp/turnbell-overlay.tar.gz
-          tar -xJf /tmp/turnbell-source.tar.xz -C /tmp/turnbell-source
           tar -xzf /tmp/turnbell-overlay.tar.gz -C /tmp/turnbell-overlay
 
           if [[ -d /tmp/turnbell-overlay/files ]]; then
@@ -86,8 +96,9 @@ jobs:
           fi
 
           if [[ ! -f /tmp/turnbell-source/README.md ]]; then
-            project_root="$(dirname "$(find /tmp/turnbell-source -type f -path '*/extension/manifest.json' -print -quit)")"
-            project_root="$(dirname "$project_root")"
+            manifest_path="$(find /tmp/turnbell-source -type f -path '*/extension/manifest.json' -print -quit)"
+            test -n "$manifest_path"
+            project_root="$(dirname "$(dirname "$manifest_path")")"
             test -f "$project_root/README.md"
             rm -rf /tmp/turnbell-project
             mv "$project_root" /tmp/turnbell-project
@@ -98,6 +109,87 @@ jobs:
           test -s /tmp/turnbell-source/README.md
           test -s /tmp/turnbell-source/extension/manifest.json
           test "$(node -p "require('/tmp/turnbell-source/extension/manifest.json').version")" = '1.5.0'
+
+          cat > /tmp/required-files.txt <<'EOF'
+          .gitignore
+          CHANGELOG.md
+          CONTRIBUTING.md
+          INSTALL-WINDOWS.md
+          Install-Or-Update-Current-Edge.cmd
+          LICENSE
+          Open-Windows-Notification-Settings.cmd
+          PRIVACY.md
+          README.md
+          SECURITY.md
+          THIRD_PARTY_NOTICES.md
+          VERIFICATION-1.5.0.txt
+          docs/images/chrome-install.png
+          docs/images/chrome-install.webp
+          docs/images/chrome-notification-demo.png
+          docs/images/chrome-notification-demo.webp
+          docs/images/chrome-notification.webp
+          docs/images/edge-install.webp
+          docs/images/edge-notification.webp
+          docs/images/notification-demo.webp
+          docs/images/settings-advanced.webp
+          docs/images/settings-overview.webp
+          extension/assets/icons/icon-128.png
+          extension/assets/icons/icon-16.png
+          extension/assets/icons/icon-32.png
+          extension/assets/icons/icon-48.png
+          extension/assets/sounds/digital.wav
+          extension/assets/sounds/gentle-pop.wav
+          extension/assets/sounds/glass.wav
+          extension/assets/sounds/soft-chime.wav
+          extension/assets/sounds/warm-bell.wav
+          extension/manifest.json
+          extension/offscreen.html
+          extension/popup.css
+          extension/popup.html
+          extension/src/background.js
+          extension/src/bootstrap-core.js
+          extension/src/content.js
+          extension/src/detector-core.js
+          extension/src/dom-model-core.js
+          extension/src/finalization-core.js
+          extension/src/notification-core.js
+          extension/src/offscreen.js
+          extension/src/popup.js
+          extension/src/sample-scheduler-core.js
+          extension/src/tab-monitor-core.js
+          extension/tests/background-integration.test.js
+          extension/tests/bootstrap-core.test.js
+          extension/tests/content-dom-model.test.js
+          extension/tests/content-final-signal.test.js
+          extension/tests/content-idempotence.test.js
+          extension/tests/content-lifecycle-integration.test.js
+          extension/tests/content-privacy.test.js
+          extension/tests/content-user-intent.test.js
+          extension/tests/detector-core.test.js
+          extension/tests/dom-model-core.test.js
+          extension/tests/finalization-core.test.js
+          extension/tests/manifest.test.js
+          extension/tests/notification-core.test.js
+          extension/tests/offscreen-audio.test.js
+          extension/tests/popup.test.js
+          extension/tests/sample-scheduler-core.test.js
+          extension/tests/tab-monitor-core.test.js
+          scripts/build-all.sh
+          scripts/build-extension-zip.py
+          scripts/package-artifacts.py
+          scripts/tests/test_package_layout.py
+          scripts/verify-artifacts.py
+          EOF
+          sed -i 's/^          //' /tmp/required-files.txt
+
+          missing=0
+          while IFS= read -r path; do
+            if [[ ! -f "/tmp/turnbell-source/$path" ]]; then
+              echo "MISSING $path"
+              missing=1
+            fi
+          done < /tmp/required-files.txt
+          test "$missing" -eq 0
 
           rm -rf /tmp/turnbell-source/.git \
                  /tmp/turnbell-source/.github \
@@ -117,15 +209,6 @@ jobs:
           git add -A
           git commit -m 'Publish TurnBell 1.5.0'
           git push --force origin HEAD:main
-
-          for branch in \
-            agent/publish-turnbell-1.5.0 \
-            bootstrap-publish \
-            publish-final \
-            publish-run-1.5.0 \
-            publish-turnbell-1.5.0-final; do
-            git push origin --delete "$branch" || true
-          done
 
           trap - ERR
           gh issue close "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" --comment 'TurnBell 1.5.0 was published directly to main.'

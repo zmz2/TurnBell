@@ -1,0 +1,31 @@
+name: Finalize TurnBell 1.5.0 v4
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.turnbell-finalize-v4/EXECUTE-*'
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: turnbell-1.5.0-final-publication-v4
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Execute verified publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/turnbell-finalize-v4.sh

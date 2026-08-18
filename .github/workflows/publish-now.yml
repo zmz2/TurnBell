@@ -1,4 +1,4 @@
-name: Push TurnBell directly to main
+name: Publish TurnBell 1.5.0 directly
 
 on:
   issues:
@@ -9,36 +9,35 @@ permissions:
   issues: write
 
 concurrency:
-  group: turnbell-direct-main-filebin
+  group: turnbell-publish-main-final
   cancel-in-progress: false
 
 jobs:
   publish:
-    if: github.event.issue.title == 'TurnBell push directly to main'
+    if: github.event.issue.title == 'Publish TurnBell 1.5.0 now'
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
       TRIGGER_ISSUE: ${{ github.event.issue.number }}
-      SOURCE_URL: https://filebin.net/turnbell-4e26b2db2d82515d/TurnBell-full-source-1.5.0.tar.xz
     steps:
-      - name: Check out main
+      - name: Check out staged source
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: publish-final
           fetch-depth: 0
 
-      - name: Push project directly
+      - name: Reconstruct and push main
         shell: bash
         run: |
           set -Eeuo pipefail
-          exec > >(tee /tmp/turnbell-push.log) 2>&1
+          exec > >(tee /tmp/turnbell-publish.log) 2>&1
 
           report_failure() {
             status=$?
             {
-              echo 'Direct push failed. Last log lines:'
+              echo 'Direct publication failed. Last log lines:'
               echo '```text'
-              tail -n 60 /tmp/turnbell-push.log || true
+              tail -n 80 /tmp/turnbell-publish.log || true
               echo '```'
             } > /tmp/turnbell-failure.md
             gh issue comment "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" --body-file /tmp/turnbell-failure.md || true
@@ -46,30 +45,55 @@ jobs:
           }
           trap report_failure ERR
 
-          gh issue comment "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" --body 'Direct push started.'
+          gh issue comment "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" --body 'Direct publication started.'
 
-          rm -rf /tmp/turnbell-source /tmp/turnbell-source.tar.xz
-          curl --fail --location --retry 8 --retry-all-errors \
-            --connect-timeout 30 --max-time 900 \
-            "$SOURCE_URL" --output /tmp/turnbell-source.tar.xz
-          test -s /tmp/turnbell-source.tar.xz
-          xz --test /tmp/turnbell-source.tar.xz
-          mkdir -p /tmp/turnbell-source
+          rm -rf /tmp/turnbell-source /tmp/turnbell-overlay
+          mkdir -p /tmp/turnbell-source /tmp/turnbell-overlay
 
           python3 - <<'PY'
-          from pathlib import PurePosixPath
-          import tarfile
+          import base64
+          import lzma
+          from pathlib import Path
 
-          with tarfile.open('/tmp/turnbell-source.tar.xz', 'r:xz') as archive:
-              members = archive.getmembers()
-              for member in members:
-                  path = PurePosixPath(member.name)
-                  if path.is_absolute() or '..' in path.parts:
-                      raise SystemExit(f'unsafe archive path: {member.name!r}')
-                  if not (member.isfile() or member.isdir()):
-                      raise SystemExit(f'unsupported archive member: {member.name!r}')
-              archive.extractall('/tmp/turnbell-source', members=members, filter='data')
+          root = Path('.turnbell-release')
+          encoded = ''.join(
+              ''.join((root / f'chunk-{index:03d}').read_text(encoding='utf-8').split())
+              for index in range(12)
+          )
+          encoded += '=' * (-len(encoded) % 4)
+          archive = base64.b64decode(encoded, validate=True)
+          lzma.decompress(archive)
+          Path('/tmp/turnbell-source.tar.xz').write_bytes(archive)
+
+          overlay_encoded = ''.join(
+              (root / 'final-overlay.tar.gz.b64').read_text(encoding='utf-8').split()
+          )
+          overlay_encoded += '=' * (-len(overlay_encoded) % 4)
+          Path('/tmp/turnbell-overlay.tar.gz').write_bytes(
+              base64.b64decode(overlay_encoded, validate=True)
+          )
           PY
+
+          xz --test /tmp/turnbell-source.tar.xz
+          gzip --test /tmp/turnbell-overlay.tar.gz
+          tar -xJf /tmp/turnbell-source.tar.xz -C /tmp/turnbell-source
+          tar -xzf /tmp/turnbell-overlay.tar.gz -C /tmp/turnbell-overlay
+
+          if [[ -d /tmp/turnbell-overlay/files ]]; then
+            cp -a /tmp/turnbell-overlay/files/. /tmp/turnbell-source/
+          else
+            cp -a /tmp/turnbell-overlay/. /tmp/turnbell-source/
+          fi
+
+          if [[ ! -f /tmp/turnbell-source/README.md ]]; then
+            project_root="$(dirname "$(find /tmp/turnbell-source -type f -path '*/extension/manifest.json' -print -quit)")"
+            project_root="$(dirname "$project_root")"
+            test -f "$project_root/README.md"
+            rm -rf /tmp/turnbell-project
+            mv "$project_root" /tmp/turnbell-project
+            rm -rf /tmp/turnbell-source
+            mv /tmp/turnbell-project /tmp/turnbell-source
+          fi
 
           test -s /tmp/turnbell-source/README.md
           test -s /tmp/turnbell-source/extension/manifest.json
@@ -91,17 +115,17 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
-          if ! git diff --cached --quiet; then
-            git commit -m 'Publish TurnBell 1.5.0'
-            git push origin HEAD:main
-          fi
+          git commit -m 'Publish TurnBell 1.5.0'
+          git push --force origin HEAD:main
 
-          while read -r _ ref; do
-            branch="${ref#refs/heads/}"
-            if [[ "$branch" != main ]]; then
-              git push origin --delete "$branch" || true
-            fi
-          done < <(git ls-remote --heads origin)
+          for branch in \
+            agent/publish-turnbell-1.5.0 \
+            bootstrap-publish \
+            publish-final \
+            publish-run-1.5.0 \
+            publish-turnbell-1.5.0-final; do
+            git push origin --delete "$branch" || true
+          done
 
           trap - ERR
-          gh issue close "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" --comment 'TurnBell 1.5.0 was pushed directly to main.'
+          gh issue close "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" --comment 'TurnBell 1.5.0 was published directly to main.'

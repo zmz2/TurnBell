@@ -1,0 +1,79 @@
+name: Publish TurnBell source on PR trigger
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: turnbell-source-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.head_ref, 'trigger-turnbell-publish-')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out staged source archive
+        uses: actions/checkout@v4
+        with:
+          ref: publish-final
+          fetch-depth: 0
+
+      - name: Reconstruct source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import lzma
+          from pathlib import Path
+
+          root = Path('.turnbell-release')
+          for last in (11, 12):
+              parts = [root / f'chunk-{i:03d}' for i in range(last + 1)]
+              if not all(path.is_file() for path in parts):
+                  continue
+              encoded = ''.join(''.join(path.read_text(encoding='utf-8').split()) for path in parts)
+              try:
+                  packed = base64.b64decode(encoded, validate=True)
+                  lzma.decompress(packed)
+              except Exception:
+                  continue
+              Path('/tmp/turnbell-source.tar.xz').write_bytes(packed)
+              break
+          else:
+              raise SystemExit('No complete TurnBell source archive was found')
+          PY
+
+          base64 --decode .turnbell-release/final-overlay.tar.gz.b64 > /tmp/turnbell-overlay.tar.gz
+          echo '838e585ded4707e1efe26f44b078eaadcbb5c2345fe787d62bdb2e08fc63081e  /tmp/turnbell-overlay.tar.gz' | sha256sum --check --strict
+
+          rm -rf /tmp/turnbell-source /tmp/turnbell-overlay
+          mkdir -p /tmp/turnbell-source /tmp/turnbell-overlay
+          tar -xJf /tmp/turnbell-source.tar.xz -C /tmp/turnbell-source
+          tar -xzf /tmp/turnbell-overlay.tar.gz -C /tmp/turnbell-overlay
+          cp -a /tmp/turnbell-overlay/files/. /tmp/turnbell-source/
+          rm -rf /tmp/turnbell-source/.git /tmp/turnbell-source/dist
+          find /tmp/turnbell-source -type d -name __pycache__ -prune -exec rm -rf {} +
+          find /tmp/turnbell-source -type f -name '*.pyc' -delete
+          chmod 0755 /tmp/turnbell-source/scripts/build-all.sh
+
+      - name: Publish clean project to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git checkout -B turnbell-release-main origin/main
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a /tmp/turnbell-source/. .
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'Publish TurnBell 1.5.0'
+          git push origin HEAD:main

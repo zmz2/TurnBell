@@ -9,95 +9,366 @@ permissions:
   issues: write
 
 concurrency:
-  group: turnbell-direct-publish-1.5.0
+  group: turnbell-direct-publish-1.5.0-final
   cancel-in-progress: false
 
 jobs:
   publish:
-    if: github.event.issue.title == 'TurnBell direct publish 1.5.0'
-    runs-on: ubuntu-latest
+    if: github.event.issue.title == 'TurnBell direct publish 1.5.0 final'
+    runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
       TRIGGER_ISSUE: ${{ github.event.issue.number }}
     steps:
       - name: Mark publication started
-        run: gh issue comment "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" --body 'Direct publication started.'
+        shell: bash
+        run: |
+          gh issue comment "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" \
+            --body 'TurnBell 1.5.0 direct publication started.'
 
-      - name: Check out staged project
+      - name: Check out verified staging data
         uses: actions/checkout@v4
         with:
           ref: publish-final
           fetch-depth: 0
 
-      - name: Reconstruct and push uploaded project
+      - name: Reconstruct and verify source tree
         shell: bash
         run: |
           set -Eeuo pipefail
-          exec > >(tee /tmp/turnbell-publish.log) 2>&1
-          report_failure() {
-            status=$?
-            {
-              echo 'Direct publication failed. Last log lines:'
-              echo '```'
-              tail -n 40 /tmp/turnbell-publish.log || true
-              echo '```'
-            } > /tmp/turnbell-failure.md
-            gh issue comment "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" --body-file /tmp/turnbell-failure.md || true
-            exit "$status"
-          }
-          trap report_failure ERR
+          exec > >(tee -a "$RUNNER_TEMP/turnbell-publish.log") 2>&1
 
           python3 - <<'PY'
+          from __future__ import annotations
+
           import base64
           import lzma
           from pathlib import Path
 
           root = Path('.turnbell-release')
-          chunks = [root / f'chunk-{i:03d}' for i in range(13)]
-          for last in (11, 12):
+          chunks = [root / f'chunk-{index:03d}' for index in range(13)]
+          missing = [str(path) for path in chunks if not path.is_file()]
+          if missing:
+              raise SystemExit(f'missing source chunks: {missing}')
+
+          failures: list[str] = []
+          for last_index in (11, 12):
               encoded = ''.join(
                   ''.join(path.read_text(encoding='utf-8').split())
-                  for path in chunks[:last + 1]
+                  for path in chunks[: last_index + 1]
               )
+              padded = encoded + ('=' * ((-len(encoded)) % 4))
               try:
-                  archive = base64.b64decode(encoded, validate=True)
-                  lzma.decompress(archive)
-              except Exception:
+                  compressed = base64.b64decode(padded, validate=True)
+                  lzma.decompress(compressed)
+              except Exception as exc:
+                  failures.append(
+                      f'chunk-000..chunk-{last_index:03d}: '
+                      f'encoded={len(encoded)}, padded={len(padded)}, error={exc}'
+                  )
                   continue
-              Path('/tmp/turnbell-source.tar.xz').write_bytes(archive)
+              Path('/tmp/turnbell-source.tar.xz').write_bytes(compressed)
+              print(
+                  f'selected chunk-000..chunk-{last_index:03d}; '
+                  f'encoded={len(encoded)}, archive={len(compressed)}'
+              )
               break
           else:
-              raise SystemExit('Unable to reconstruct the uploaded project archive')
+              raise SystemExit('no complete staged XZ stream found:\n' + '\n'.join(failures))
           PY
 
-          base64 --decode .turnbell-release/final-overlay.tar.gz.b64 > /tmp/turnbell-overlay.tar.gz
+          printf '%s  %s\n' \
+            '838e585ded4707e1efe26f44b078eaadcbb5c2345fe787d62bdb2e08fc63081e' \
+            '/tmp/turnbell-overlay.tar.gz' > /tmp/overlay.sha256
+          base64 --decode .turnbell-release/final-overlay.tar.gz.b64 \
+            > /tmp/turnbell-overlay.tar.gz
+          sha256sum --check --strict /tmp/overlay.sha256
+
           rm -rf /tmp/turnbell-source /tmp/turnbell-overlay
           mkdir -p /tmp/turnbell-source /tmp/turnbell-overlay
-          tar -xJf /tmp/turnbell-source.tar.xz -C /tmp/turnbell-source
-          tar -xzf /tmp/turnbell-overlay.tar.gz -C /tmp/turnbell-overlay
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path, PurePosixPath
+          import tarfile
+
+          def extract_safe(archive: Path, destination: Path, mode: str) -> None:
+              with tarfile.open(archive, mode) as bundle:
+                  members = bundle.getmembers()
+                  for member in members:
+                      path = PurePosixPath(member.name)
+                      if path.is_absolute() or '..' in path.parts:
+                          raise SystemExit(f'unsafe archive member: {member.name!r}')
+                      if not (member.isfile() or member.isdir()):
+                          raise SystemExit(f'unsupported archive member: {member.name!r}')
+                  bundle.extractall(destination, members=members, filter='data')
+
+          extract_safe(Path('/tmp/turnbell-source.tar.xz'), Path('/tmp/turnbell-source'), 'r:xz')
+          extract_safe(Path('/tmp/turnbell-overlay.tar.gz'), Path('/tmp/turnbell-overlay'), 'r:gz')
+          PY
+
+          test -d /tmp/turnbell-overlay/files
           cp -a /tmp/turnbell-overlay/files/. /tmp/turnbell-source/
 
           rm -rf /tmp/turnbell-source/.git \
-                 /tmp/turnbell-source/.github \
-                 /tmp/turnbell-source/.turnbell-release \
-                 /tmp/turnbell-source/.turnbell-transport \
-                 /tmp/turnbell-source/dist
-          find /tmp/turnbell-source -type d -name __pycache__ -prune -exec rm -rf {} +
+            /tmp/turnbell-source/.github \
+            /tmp/turnbell-source/dist
+          find /tmp/turnbell-source -maxdepth 1 -type d -name '.turnbell-*' \
+            -prune -exec rm -rf {} +
+          find /tmp/turnbell-source -type d -name __pycache__ \
+            -prune -exec rm -rf {} +
           find /tmp/turnbell-source -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+          chmod 0755 /tmp/turnbell-source/scripts/build-all.sh
 
+          test -z "$(find /tmp/turnbell-source -type l -print -quit)"
+          test -z "$(find /tmp/turnbell-source -type f \( -iname '*.exe' -o -iname '*.msi' \) -print -quit)"
+          cd /tmp/turnbell-source
+          find . -type f -printf '%P\n' | LC_ALL=C sort > /tmp/actual-files.txt
+          diff -u /tmp/turnbell-overlay/expected-files.txt /tmp/actual-files.txt
+          sha256sum --check --strict /tmp/turnbell-overlay/expected.sha256
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+
+          manifest = json.loads(Path('extension/manifest.json').read_text(encoding='utf-8'))
+          assert manifest['manifest_version'] == 3
+          assert manifest['version'] == '1.5.0'
+          assert set(manifest['permissions']) == {
+              'notifications', 'storage', 'offscreen', 'scripting'
+          }
+          assert set(manifest['host_permissions']) == {
+              'https://chatgpt.com/*',
+              'https://chat.openai.com/*',
+          }
+          print('Manifest verification passed.')
+          PY
+
+      - name: Run all tests and build release assets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/turnbell-publish.log") 2>&1
+          cd /tmp/turnbell-source
+          node --test extension/tests/*.test.js
+          while IFS= read -r -d '' file; do
+            node --check "$file"
+          done < <(find extension -name '*.js' -print0)
+          python3 -m unittest discover -s scripts/tests -v
+          python3 -m py_compile scripts/*.py scripts/tests/*.py
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+          ./scripts/build-all.sh
+          python3 scripts/verify-artifacts.py --root . --version 1.5.0
+          (cd dist && sha256sum --check --strict SHA256SUMS.txt)
+
+          mkdir -p "$RUNNER_TEMP/turnbell-release-assets"
+          cp dist/TurnBell-1.5.0-extension.zip \
+             dist/TurnBell-1.5.0-Edge-Only.zip \
+             dist/TurnBell-1.5.0-project.zip \
+             dist/SHA256SUMS.txt \
+             "$RUNNER_TEMP/turnbell-release-assets/"
+
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+
+      - name: Publish clean project tree directly to main
+        id: publish
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/turnbell-publish.log") 2>&1
           git fetch origin main
           git checkout -B turnbell-direct-main origin/main
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           cp -a /tmp/turnbell-source/. .
+          rm -rf dist .github
+          find . -maxdepth 1 -type d -name '.turnbell-*' -prune -exec rm -rf {} +
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
+          git diff --cached --check
           if ! git diff --cached --quiet; then
             git commit -m 'Publish TurnBell 1.5.0'
             git push origin HEAD:main
           fi
+          echo "main_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Create tag, Release, assets, and repository metadata
+        shell: bash
+        env:
+          MAIN_SHA: ${{ steps.publish.outputs.main_sha }}
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/turnbell-publish.log") 2>&1
+
+          cat > "$RUNNER_TEMP/release-notes.md" <<'EOF'
+          ## 主要功能
+
+          - ChatGPT 回复真正完成后发送 Windows 系统通知
+          - 支持 Microsoft Edge 和 Google Chrome
+          - 支持 ChatGPT Instant / 极速回复完成提醒
+          - 切换标签页或其他 Windows 应用后仍可提醒
+          - 刷新已有历史对话保持静默
+          - 每轮至多提醒一次，并抑制重复完成信号
+          - 支持 Windows 默认通知声和可选本地音效
+          - 无需 EXE、无需本地端口或后台服务
+
+          ## 隐私
+
+          - 仅在浏览器本地观察页面 DOM 状态
+          - 不读取 Cookie、密码、Token 或账户凭据
+          - 不上传对话或助手回答正文
+          - 不拦截 fetch、XMLHttpRequest 或网络响应流
+          - 不使用 webRequest
+          - 无遥测、广告、混淆或远程 JavaScript
+
+          ## 已完成实机测试
+
+          - Windows + Microsoft Edge
+          - Windows + Google Chrome
+
+          ## 尚未实机验证
+
+          - macOS
+          - Linux
+          - Brave、Vivaldi 等其他 Chromium 浏览器
+          - Edge InPrivate
+          - Chrome 无痕模式
+          - 受学校、公司或组织策略管理的浏览器环境
+
+          TurnBell 是一个非官方、独立的开源项目，与 OpenAI、Microsoft 或 Google 不存在隶属、赞助、认证、合作或背书关系。
+          EOF
+
+          if gh release view v1.5.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete v1.5.0 --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          elif git ls-remote --exit-code --tags origin refs/tags/v1.5.0 >/dev/null 2>&1; then
+            git push origin :refs/tags/v1.5.0
+          fi
+
+          gh release create v1.5.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$MAIN_SHA" \
+            --title 'TurnBell 1.5.0' \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            "$RUNNER_TEMP/turnbell-release-assets/TurnBell-1.5.0-extension.zip" \
+            "$RUNNER_TEMP/turnbell-release-assets/TurnBell-1.5.0-Edge-Only.zip" \
+            "$RUNNER_TEMP/turnbell-release-assets/TurnBell-1.5.0-project.zip" \
+            "$RUNNER_TEMP/turnbell-release-assets/SHA256SUMS.txt"
+
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY" \
+            -f description='Privacy-first completion notifications for ChatGPT on Microsoft Edge and Google Chrome.' \
+            >/dev/null
+
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/topics" \
+            -H 'Accept: application/vnd.github+json' \
+            -f 'names[]=browser-extension' \
+            -f 'names[]=chrome-extension' \
+            -f 'names[]=edge-extension' \
+            -f 'names[]=chromium-extension' \
+            -f 'names[]=manifest-v3' \
+            -f 'names[]=chatgpt' \
+            -f 'names[]=notifications' \
+            -f 'names[]=windows' \
+            -f 'names[]=privacy' \
+            -f 'names[]=productivity' \
+            >/dev/null
+
+      - name: Verify public main, README images, archive, and Release
+        shell: bash
+        env:
+          MAIN_SHA: ${{ steps.publish.outputs.main_sha }}
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/turnbell-publish.log") 2>&1
+          git fetch origin main --tags
+          test "$(git rev-parse origin/main)" = "$MAIN_SHA"
+
+          rm -rf /tmp/turnbell-main /tmp/turnbell-release-download
+          git worktree add --detach /tmp/turnbell-main origin/main
+          cd /tmp/turnbell-main
+
+          for path in \
+            README.md LICENSE PRIVACY.md SECURITY.md CONTRIBUTING.md \
+            THIRD_PARTY_NOTICES.md CHANGELOG.md INSTALL-WINDOWS.md \
+            extension/manifest.json extension/src extension/assets \
+            extension/tests scripts docs/images; do
+            test -e "$path"
+          done
+
+          test ! -e .github
+          test ! -e .turnbell-release
+          test ! -e dist
+          test -z "$(find . -maxdepth 1 -type d -name '.turnbell-*' -print -quit)"
+          test -z "$(find . -type d -name __pycache__ -print -quit)"
+          test -z "$(find . -type f \( -name '*.pyc' -o -name '*.pyo' -o -iname '*.exe' -o -iname '*.msi' \) -print -quit)"
+          find . -type f ! -path './.git/*' -printf '%P\n' | LC_ALL=C sort > /tmp/public-files.txt
+          diff -u /tmp/turnbell-overlay/expected-files.txt /tmp/public-files.txt
+          sha256sum --check --strict /tmp/turnbell-overlay/expected.sha256
+
+          node --test extension/tests/*.test.js
+          while IFS= read -r -d '' file; do
+            node --check "$file"
+          done < <(find extension -name '*.js' -print0)
+          python3 -m unittest discover -s scripts/tests -v
+
+          images=(
+            notification-demo.webp
+            chrome-notification-demo.png
+            edge-install.webp
+            chrome-install.png
+            settings-overview.webp
+            settings-advanced.webp
+          )
+          for name in "${images[@]}"; do
+            path="docs/images/$name"
+            test -s "$path"
+            grep -Fq "$path" README.md
+            gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$MAIN_SHA" >/dev/null
+          done
+
+          gh api -H 'Accept: application/vnd.github.html+json' \
+            "repos/$GITHUB_REPOSITORY/readme?ref=$MAIN_SHA" \
+            > /tmp/turnbell-readme-rendered.html
+          for name in "${images[@]}"; do
+            grep -Fq "$name" /tmp/turnbell-readme-rendered.html
+          done
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            "https://github.com/$GITHUB_REPOSITORY/archive/refs/heads/main.zip" \
+            --output /tmp/TurnBell-main.zip
+          unzip -t /tmp/TurnBell-main.zip >/dev/null
+          unzip -Z1 /tmp/TurnBell-main.zip | grep -Fx 'TurnBell-main/extension/manifest.json'
+
+          test "$(gh release view v1.5.0 --repo "$GITHUB_REPOSITORY" --json name --jq .name)" = 'TurnBell 1.5.0'
+          test "$(gh release view v1.5.0 --repo "$GITHUB_REPOSITORY" --json targetCommitish --jq .targetCommitish)" = "$MAIN_SHA"
+          assets="$(gh release view v1.5.0 --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          for asset in \
+            TurnBell-1.5.0-extension.zip \
+            TurnBell-1.5.0-Edge-Only.zip \
+            TurnBell-1.5.0-project.zip \
+            SHA256SUMS.txt; do
+            grep -Fxq "$asset" <<< "$assets"
+          done
+
+          mkdir -p /tmp/turnbell-release-download
+          gh release download v1.5.0 --repo "$GITHUB_REPOSITORY" \
+            --dir /tmp/turnbell-release-download
+          cd /tmp/turnbell-release-download
+          sha256sum --check --strict SHA256SUMS.txt
+
+          cd "$GITHUB_WORKSPACE"
+          git worktree remove /tmp/turnbell-main
+
+      - name: Remove every temporary branch
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/turnbell-publish.log") 2>&1
           for branch in \
             agent/publish-turnbell-1.5.0 \
             bootstrap-publish \
@@ -106,6 +377,31 @@ jobs:
             publish-turnbell-1.5.0-final; do
             git push origin --delete "$branch" || true
           done
+          test "$(git ls-remote --heads origin | wc -l | tr -d ' ')" = '1'
+          git ls-remote --heads origin | grep -F 'refs/heads/main'
 
-          trap - ERR
-          gh issue close "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" --comment 'TurnBell 1.5.0 was published directly to main.'
+      - name: Close publication trigger
+        if: success()
+        shell: bash
+        run: |
+          gh issue close "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" \
+            --comment 'TurnBell 1.5.0 was published directly to main, verified, released, and temporary branches were removed.'
+
+      - name: Report publication failure
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo 'TurnBell 1.5.0 direct publication failed. Last log lines:'
+            echo
+            echo '```text'
+            if test -f "$RUNNER_TEMP/turnbell-publish.log"; then
+              tail -n 180 "$RUNNER_TEMP/turnbell-publish.log"
+            else
+              echo 'No shell-step log was produced.'
+            fi
+            echo '```'
+          } > "$RUNNER_TEMP/turnbell-failure.md"
+          gh issue comment "$TRIGGER_ISSUE" --repo "$GITHUB_REPOSITORY" \
+            --body-file "$RUNNER_TEMP/turnbell-failure.md" || true

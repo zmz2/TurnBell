@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   publish:
-    if: github.event.issue.title == 'Publish TurnBell 1.5.0 now'
+    if: github.event.issue.title == 'Publish TurnBell 1.5.0 now v2'
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
@@ -58,7 +58,7 @@ jobs:
           root = Path('.turnbell-release')
           encoded = ''.join(
               ''.join((root / f'chunk-{index:03d}').read_text(encoding='utf-8').split())
-              for index in range(12)
+              for index in range(13)
           )
           encoded += '=' * (-len(encoded) % 4)
           archive = base64.b64decode(encoded, validate=True)

@@ -227,4 +227,4 @@ docs/images/        README 使用的安装与界面图片
 代码及 TurnBell 原创图标、内置音效采用 [MIT License](LICENSE)。第三方名称、商标和文档截图说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 TurnBell 是非官方独立项目，与 OpenAI 或 Microsoft 无隶属、赞助、认证或合作关系。`ChatGPT`、`OpenAI`、`Microsoft`、`Windows` 和 `Microsoft Edge` 等名称仅用于准确说明兼容对象与测试环境，相关商标归各自权利人所有。
-TESTMARKER
+

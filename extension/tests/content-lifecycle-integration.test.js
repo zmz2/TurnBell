@@ -12,6 +12,12 @@ const notificationAPI = require('../src/notification-core.js');
 const bootstrapAPI = require('../src/bootstrap-core.js');
 
 function nextTurn() { return new Promise((resolve) => setImmediate(resolve)); }
+async function flushEffects(count = 4) {
+  for (let index = 0; index < count; index += 1) {
+    await Promise.resolve();
+    await nextTurn();
+  }
+}
 
 function makeTurn(text, identity) {
   return { text, identity, container: { identity } };
@@ -22,7 +28,9 @@ test('hydrated history stays silent, then regular and Instant Enter-sent turns e
   let runtimeListener = null;
   let observer = null;
   const documentListeners = new Map();
+  const globalListeners = new Map();
   const runtimeMessages = [];
+  const sampleScheduleCalls = [];
   const page = {
     assistantTurns: [],
     userTurns: [],
@@ -76,11 +84,13 @@ test('hydrated history stays silent, then regular and Instant Enter-sent turns e
     clearTimeout() {},
     setInterval() { return 1; },
     queueMicrotask(callback) { Promise.resolve().then(callback); },
-    addEventListener() {},
+    addEventListener(type, listener) { globalListeners.set(type, listener); },
     GPTReplyDetector: detectorAPI,
     GPTReplyNotification: notificationAPI,
     GPTReplySampleScheduler: {
-      createSampleScheduler() { return { schedule() {}, dispose() {} }; },
+      createSampleScheduler() {
+        return { schedule(delay) { sampleScheduleCalls.push(delay); }, dispose() {} };
+      },
     },
     TurnBellBootstrap: bootstrapAPI,
     TurnBellDOMModel: {
@@ -118,7 +128,25 @@ test('hydrated history stays silent, then regular and Instant Enter-sent turns e
 
   vm.createContext(context);
   vm.runInContext(contentSource, context, { filename: 'content.js' });
-  await nextTurn();
+  await flushEffects();
+
+  let schedulesBeforeResume = sampleScheduleCalls.length;
+  globalListeners.get('focus')();
+  assert.equal(sampleScheduleCalls.length, schedulesBeforeResume + 1);
+  assert.equal(sampleScheduleCalls.at(-1), 0);
+  schedulesBeforeResume = sampleScheduleCalls.length;
+  documentListeners.get('resume')();
+  assert.equal(sampleScheduleCalls.length, schedulesBeforeResume + 1);
+  assert.equal(sampleScheduleCalls.at(-1), 0);
+  await flushEffects();
+
+  async function sampleNow() {
+    const response = await new Promise((resolve) => {
+      runtimeListener({ type: 'monitor-sample-now' }, {}, resolve);
+    });
+    await flushEffects();
+    return response;
+  }
 
   // Existing history hydrates after document_start. It must become a silent baseline.
   now = 100;
@@ -128,7 +156,7 @@ test('hydrated history stays silent, then regular and Instant Enter-sent turns e
   page.finalAction = true;
   observer.callback([]);
   now = 1_100;
-  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  await sampleNow();
   assert.equal(runtimeMessages.some((message) => message.type === 'turn-start'), false);
   assert.equal(runtimeMessages.some((message) => message.type === 'dom-final-candidate'), false);
 
@@ -147,29 +175,33 @@ test('hydrated history stays silent, then regular and Instant Enter-sent turns e
   page.userTurns = [...page.userTurns, makeTurn('new question', 'user-new')];
   page.generating = true;
   page.finalAction = false;
-  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  await sampleNow();
 
   now = 2_300;
   page.assistantTurns = [...page.assistantTurns, makeTurn('partial answer', 'assistant-new')];
-  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  await sampleNow();
 
   now = 3_000;
   page.assistantTurns = [page.assistantTurns[0], makeTurn('complete answer', 'assistant-new')];
   page.generating = false;
   page.finalAction = true;
-  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  await sampleNow();
 
   now = 4_300;
-  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  await sampleNow();
   now = 5_000;
-  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  await sampleNow();
 
   let starts = runtimeMessages.filter((message) => message.type === 'turn-start');
   let candidates = runtimeMessages.filter((message) => message.type === 'dom-final-candidate');
-  assert.equal(starts.length, 1);
+  assert.ok(starts.length >= 1);
+  assert.equal(new Set(starts.map((message) => message.completionId)).size, 1);
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0].payload.event.hasFinalAction, true);
   assert.equal(JSON.stringify(candidates[0]).includes('complete answer'), false);
+  assert.match(candidates[0].pathHash, /^[a-f0-9]{32}$/u);
+  assert.equal(candidates[0].routeEpoch, 1);
+  assert.ok(candidates[0].completionId);
 
   // Instant can skip the visible reasoning/generating state and may expose no
   // final action row. Explicit Enter intent plus a conservative 3-second
@@ -184,7 +216,7 @@ test('hydrated history stays silent, then regular and Instant Enter-sent turns e
   page.assistantTurns = [...page.assistantTurns, makeTurn('instant final answer', 'assistant-instant')];
   page.generating = false;
   page.finalAction = false;
-  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  await sampleNow();
 
   const instantSettle = runtimeMessages
     .filter((message) => message.type === 'schedule-settle-check')
@@ -192,16 +224,37 @@ test('hydrated history stays silent, then regular and Instant Enter-sent turns e
   assert.equal(instantSettle?.delayMs, 3_000);
 
   now = 9_099;
-  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  await sampleNow();
   assert.equal(runtimeMessages.filter((message) => message.type === 'dom-final-candidate').length, 1);
   now = 9_100;
-  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  await sampleNow();
 
   starts = runtimeMessages.filter((message) => message.type === 'turn-start');
   candidates = runtimeMessages.filter((message) => message.type === 'dom-final-candidate');
-  assert.equal(starts.length, 2);
+  assert.ok(starts.length >= 2);
+  assert.equal(new Set(starts.map((message) => message.completionId)).size, 2);
   assert.equal(candidates.length, 2);
   assert.equal(candidates[1].payload.event.hasFinalAction, false);
   assert.equal(candidates[1].payload.event.finalEvidence, 'explicit-fast-stable');
   assert.equal(JSON.stringify(candidates[1]).includes('instant final answer'), false);
+
+  // A fast switch from an existing Codex conversation to another task must
+  // suspend this turn on its original route instead of moving it to the new one.
+  now = 10_000;
+  documentListeners.get('keydown')({
+    key: 'Enter', shiftKey: false, ctrlKey: false, altKey: false, metaKey: false,
+    isComposing: false, keyCode: 13, target: composer,
+  });
+  await flushEffects();
+  const switchedCompletionId = runtimeMessages
+    .filter((message) => message.type === 'turn-start')
+    .at(-1).completionId;
+  context.location.pathname = '/c/another-task';
+  await sampleNow();
+  assert.equal(runtimeMessages.some((message) => message.type === 'turn-move'), false);
+  assert.equal(runtimeMessages.some((message) => (
+    message.type === 'turn-suspend'
+    && message.completionId === switchedCompletionId
+    && message.pathHash === candidates[0].pathHash
+  )), true);
 });

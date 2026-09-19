@@ -91,6 +91,7 @@ test('pressing Enter in the ChatGPT composer explicitly arms a new turn', async 
     closest(selector) { return selector.includes('form') || selector.includes('composer') ? this : null; },
   };
   keydown({ key: 'Enter', shiftKey: false, ctrlKey: false, altKey: false, metaKey: false, isComposing: false, target: composer });
+  await nextTurn();
 
   assert.equal(h.getArmCalls(), 1);
   assert.equal(h.runtimeMessages.some((message) => message.type === 'turn-start'), true);

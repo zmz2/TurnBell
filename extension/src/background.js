@@ -13,10 +13,19 @@ const tabMonitor = globalThis.GPTReplyTabMonitor.createMonitor(chrome);
 const NOTIFICATION_PREFIX = 'turnbell-';
 const FINALIZATION_STORAGE_KEY = 'turnbellFinalizationV2';
 const LAST_DIAGNOSTIC_KEY = 'turnbellLastNotificationDiagnostic';
+const LIFECYCLE_DIAGNOSTICS_KEY = 'turnbellLifecycleDiagnosticsV1';
+const WATCHDOG_ALARM = 'turnbell-active-turn-watchdog';
+const LOCK_REPLAY_STORAGE_KEY = 'turnbellLockedReplayQueueV1';
+const LOCK_REPLAY_TTL_MS = 24 * 60 * 60 * 1_000;
+const LOCK_REPLAY_QUEUE_LIMIT = 20;
 const settleChecks = new Map();
 let offscreenCreation = null;
 let finalizationStorePromise = null;
 let finalizationMutation = Promise.resolve();
+let diagnosticMutation = Promise.resolve();
+let lockReplayMutation = Promise.resolve();
+let lockReplayFlush = Promise.resolve();
+const lockInitialNotificationsInFlight = new Set();
 
 function storageGet(defaults) {
   return new Promise((resolve) => {
@@ -29,6 +38,20 @@ function storageGet(defaults) {
 function storageSet(items) {
   return new Promise((resolve) => {
     chrome.storage.sync.set(items, () => resolve(!chrome.runtime.lastError));
+  });
+}
+
+function localGet(defaults) {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(defaults, (items) => {
+      resolve(chrome.runtime.lastError ? defaults : items);
+    });
+  });
+}
+
+function localSet(items) {
+  return new Promise((resolve) => {
+    chrome.storage.local.set(items, () => resolve(!chrome.runtime.lastError));
   });
 }
 
@@ -137,7 +160,7 @@ async function showBrowserNotification(payload, settings) {
   }
 
   const tabPart = Number.isInteger(payload.tabId) ? payload.tabId : 'unknown';
-  const notificationId = `${NOTIFICATION_PREFIX}${tabPart}-${Date.now()}`;
+  const notificationId = String(payload.notificationId || `${NOTIFICATION_PREFIX}${tabPart}-${Date.now()}`);
   const result = await new Promise((resolve) => {
     chrome.notifications.create(notificationId, {
       type: 'basic',
@@ -151,7 +174,7 @@ async function showBrowserNotification(payload, settings) {
       silent: notificationAPI.notificationSilent(settings),
     }, (createdId) => {
       const error = chrome.runtime.lastError?.message || '';
-      resolve({ createdId: error ? null : createdId || notificationId, error });
+      resolve({ createdId: error ? null : createdId || notificationId, error, createdAt: Date.now() });
     });
   });
 
@@ -163,6 +186,7 @@ async function showBrowserNotification(payload, settings) {
       permission,
       diagnostic: 'create-failed',
       error: result.error || 'Edge did not accept the notification.',
+      createdAt: result.createdAt,
     };
   }
 
@@ -175,6 +199,7 @@ async function showBrowserNotification(payload, settings) {
     permission,
     diagnostic: active ? 'accepted-active' : 'accepted-not-active',
     error: '',
+    createdAt: result.createdAt,
   };
 }
 
@@ -190,7 +215,7 @@ async function showServiceWorkerNotification(payload, settings) {
       diagnostic: 'web-unsupported', error: 'ServiceWorkerRegistration.showNotification is unavailable.',
     };
   }
-  const tag = `turnbell-web-${Number.isInteger(payload.tabId) ? payload.tabId : 'unknown'}-${Date.now()}`;
+  const tag = String(payload.webTag || `turnbell-web-${Number.isInteger(payload.tabId) ? payload.tabId : 'unknown'}-${Date.now()}`);
   try {
     await registrationObject.showNotification(payload.title, {
       body: payload.message,
@@ -199,7 +224,12 @@ async function showServiceWorkerNotification(payload, settings) {
       tag,
       requireInteraction: settings.persistentNotification,
       silent: notificationAPI.notificationSilent(settings),
-      data: { tabId: payload.tabId, url: payload.url },
+      data: {
+        tabId: payload.tabId,
+        url: payload.url,
+        completionId: String(payload.completionId || ''),
+        notificationKind: String(payload.notificationKind || ''),
+      },
     });
     let active = true;
     if (typeof registrationObject.getNotifications === 'function') {
@@ -208,7 +238,7 @@ async function showServiceWorkerNotification(payload, settings) {
     }
     return {
       created: true, active, permission: 'granted', tag,
-      diagnostic: active ? 'web-accepted-active' : 'web-accepted-not-active', error: '',
+      diagnostic: active ? 'web-accepted-active' : 'web-accepted-not-active', error: '', createdAt: Date.now(),
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -266,6 +296,8 @@ async function routeNotification(payload, settings) {
     browser: browserResult.created,
     browserActive: browserResult.active,
     notificationId: browserResult.id,
+    webTag: webResult.tag || String(payload.webTag || ''),
+    notificationCreatedAt: browserResult.createdAt || webResult.createdAt || 0,
     permission: browserResult.permission,
     diagnostic: browserResult.diagnostic,
     error: browserResult.error,
@@ -311,6 +343,20 @@ function sendTabMessage(tabId, message) {
   });
 }
 
+function sendTabMessageBounded(tabId, message, timeoutMs = 3_000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timerId);
+      resolve(value);
+    };
+    const timerId = setTimeout(() => finish(null), timeoutMs);
+    void sendTabMessage(tabId, message).then(finish, () => finish(null));
+  });
+}
+
 async function resolvedContext(tabId, rawContext = {}) {
   const tab = await getTab(tabId);
   const windowObject = tab ? await getWindow(tab.windowId) : null;
@@ -324,6 +370,254 @@ async function resolvedContext(tabId, rawContext = {}) {
   return context;
 }
 
+function withLockReplayMutation(updater) {
+  const run = lockReplayMutation.then(async () => {
+    const items = await localGet({ [LOCK_REPLAY_STORAGE_KEY]: [] });
+    const queue = Array.isArray(items[LOCK_REPLAY_STORAGE_KEY])
+      ? items[LOCK_REPLAY_STORAGE_KEY]
+      : [];
+    const result = await updater(queue);
+    await localSet({ [LOCK_REPLAY_STORAGE_KEY]: queue });
+    return result;
+  });
+  lockReplayMutation = run.catch(() => undefined);
+  return run;
+}
+
+function lockNotificationIds(tabId, completionId) {
+  const token = String(completionId || '').replace(/[^a-z0-9-]/giu, '').slice(0, 72);
+  return {
+    token,
+    initial: `${NOTIFICATION_PREFIX}${Number.isInteger(tabId) ? tabId : 'unknown'}-lock-${token}-initial`,
+    replay: `${NOTIFICATION_PREFIX}${Number.isInteger(tabId) ? tabId : 'unknown'}-lock-${token}-unlock`,
+    initialWebTag: `turnbell-web-${token}-initial`,
+    replayWebTag: `turnbell-web-${token}-unlock`,
+  };
+}
+
+function pruneLockReplayQueue(queue, now = Date.now()) {
+  for (let index = queue.length - 1; index >= 0; index -= 1) {
+    if (!queue[index] || Number(queue[index].expiresAt) <= now) queue.splice(index, 1);
+  }
+  queue.sort((left, right) => Number(left.completedAt) - Number(right.completedAt));
+  while (queue.length > LOCK_REPLAY_QUEUE_LIMIT) queue.shift();
+}
+
+async function queryIdleState() {
+  if (typeof chrome.idle?.queryState !== 'function') return 'unknown';
+  return new Promise((resolve) => {
+    let finished = false;
+    const done = (state) => {
+      if (finished) return;
+      finished = true;
+      resolve(['active', 'idle', 'locked'].includes(String(state)) ? String(state) : 'unknown');
+    };
+    try {
+      const possiblePromise = chrome.idle.queryState(15, done);
+      if (possiblePromise && typeof possiblePromise.then === 'function') {
+        possiblePromise.then(done, () => done('unknown'));
+      }
+    } catch {
+      done('unknown');
+    }
+  });
+}
+
+async function enqueueLockedReplay(item) {
+  if (!item?.completionId) return null;
+  const now = Date.now();
+  return withLockReplayMutation((queue) => {
+    pruneLockReplayQueue(queue, now);
+    let existing = queue.find((entry) => entry.completionId === item.completionId);
+    if (!existing) {
+      existing = {
+        completionId: String(item.completionId),
+        tabId: Number.isInteger(item.tabId) ? item.tabId : null,
+        completedAt: Math.max(0, Number(item.completedAt) || now),
+        durationMs: Math.max(0, Number(item.durationMs) || 0),
+        initialNotificationId: String(item.initialNotificationId || ''),
+        replayNotificationId: String(item.replayNotificationId || ''),
+        initialWebTag: String(item.initialWebTag || ''),
+        replayWebTag: String(item.replayWebTag || ''),
+        status: 'creating-initial',
+        attempts: 0,
+        expiresAt: now + LOCK_REPLAY_TTL_MS,
+        tabClosed: false,
+      };
+      queue.push(existing);
+    }
+    pruneLockReplayQueue(queue, now);
+    return { ...existing };
+  });
+}
+
+async function updateLockedReplay(completionId, updater) {
+  const id = String(completionId || '');
+  return withLockReplayMutation((queue) => {
+    const entry = queue.find((item) => item.completionId === id);
+    if (!entry) return null;
+    return updater(entry, queue);
+  });
+}
+
+async function getLockedReplay(completionId) {
+  const id = String(completionId || '');
+  return withLockReplayMutation((queue) => {
+    const entry = queue.find((item) => item.completionId === id);
+    return entry ? { ...entry } : null;
+  });
+}
+
+async function clearNotification(id) {
+  if (!id || typeof chrome.notifications?.clear !== 'function') return false;
+  return new Promise((resolve) => {
+    try { chrome.notifications.clear(id, (cleared) => resolve(Boolean(cleared))); }
+    catch { resolve(false); }
+  });
+}
+
+async function closeWebNotification(tag) {
+  if (!tag || typeof globalThis.registration?.getNotifications !== 'function') return;
+  try {
+    const notifications = await globalThis.registration.getNotifications({ tag });
+    for (const notification of notifications || []) notification.close?.();
+  } catch { /* unsupported by the current notification backend */ }
+}
+
+async function clearReplayPair(item) {
+  await Promise.all([
+    clearNotification(item.initialNotificationId),
+    clearNotification(item.replayNotificationId),
+    closeWebNotification(item.initialWebTag),
+    closeWebNotification(item.replayWebTag),
+  ]);
+}
+
+async function acknowledgeLockedReplay(completionId) {
+  const item = await updateLockedReplay(completionId, (entry) => {
+    entry.status = 'acknowledged';
+    entry.acknowledgedAt = Date.now();
+    return { ...entry };
+  });
+  if (item) await clearReplayPair(item);
+}
+
+async function notificationWithTagExists(tag) {
+  if (!tag || typeof globalThis.registration?.getNotifications !== 'function') return false;
+  try {
+    const notifications = await globalThis.registration.getNotifications({ tag });
+    return Array.isArray(notifications) && notifications.length > 0;
+  } catch { return false; }
+}
+
+async function pendingReplayItems() {
+  return withLockReplayMutation((queue) => {
+    pruneLockReplayQueue(queue);
+    return queue
+      .filter((item) => ['creating-initial', 'pending', 'creating-replay'].includes(String(item.status)))
+      .map((item) => ({ ...item }));
+  });
+}
+
+async function flushPendingLockedReplays() {
+  const run = lockReplayFlush.then(() => performPendingLockedReplayFlush());
+  lockReplayFlush = run.catch(() => undefined);
+  return run;
+}
+
+async function performPendingLockedReplayFlush() {
+  if (await queryIdleState() === 'locked') return { replayed: 0, locked: true };
+  const items = await pendingReplayItems();
+  let replayed = 0;
+  for (const snapshot of items) {
+    if (await queryIdleState() === 'locked') return { replayed, locked: true };
+    if (snapshot.expiresAt && snapshot.expiresAt <= Date.now()) continue;
+    // A live request may still be creating the original notification. After a
+    // worker restart this in-memory marker is gone, so the orphan is recovered.
+    if (snapshot.status === 'creating-initial' && lockInitialNotificationsInFlight.has(snapshot.completionId)) continue;
+    if (snapshot.status === 'pending' && Date.now() - (Number(snapshot.lastAttemptAt) || 0) < 10_000) continue;
+    const activeNotifications = await getActiveNotifications();
+    const replayIsActive = Object.hasOwn(activeNotifications, snapshot.replayNotificationId)
+      || await notificationWithTagExists(snapshot.replayWebTag);
+    if (replayIsActive) {
+      await updateLockedReplay(snapshot.completionId, (entry) => {
+        if (['acknowledged', 'replayed'].includes(String(entry.status))) return entry;
+        entry.status = 'replayed';
+        entry.replayedAt = entry.replayedAt || Date.now();
+        return entry;
+      });
+      replayed += 1;
+      continue;
+    }
+
+    let tabClosed = snapshot.tabClosed === true;
+    if (!tabClosed && Number.isInteger(snapshot.tabId)) tabClosed = !(await getTab(snapshot.tabId));
+    const marked = await updateLockedReplay(snapshot.completionId, (entry) => {
+      if (!['creating-initial', 'pending', 'creating-replay'].includes(String(entry.status))) return null;
+      entry.status = 'creating-replay';
+      entry.attempts = Math.max(0, Number(entry.attempts) || 0) + 1;
+      entry.lastAttemptAt = Date.now();
+      entry.tabClosed = tabClosed;
+      return { ...entry };
+    });
+    if (!marked) continue;
+
+    await clearNotification(marked.initialNotificationId);
+    await closeWebNotification(marked.initialWebTag);
+    const latest = await getLockedReplay(marked.completionId);
+    if (!latest || latest.status === 'acknowledged' || latest.status === 'replayed') continue;
+    if (await queryIdleState() === 'locked') {
+      await updateLockedReplay(marked.completionId, (entry) => {
+        if (entry.status === 'creating-replay') entry.status = 'pending';
+        return entry;
+      });
+      return { replayed, locked: true };
+    }
+    const payload = notificationAPI.makeNotificationPayload({
+      durationMs: marked.durationMs,
+      fingerprint: '',
+    }, {
+      tabId: marked.tabId,
+      pageTitle: '',
+      url: 'https://chatgpt.com/',
+      tabHidden: true,
+    });
+    payload.message = '锁屏期间有一轮回复完成';
+    payload.notificationId = marked.replayNotificationId;
+    payload.webTag = marked.replayWebTag;
+    payload.completionId = marked.completionId;
+    payload.notificationKind = 'unlock-replay';
+    const settings = await getSettings();
+    const routes = await routeNotification(payload, settings);
+    if (routes.browser || routes.web) {
+      await updateLockedReplay(marked.completionId, (entry) => {
+        if (entry.status === 'acknowledged') return entry;
+        entry.status = 'replayed';
+        entry.replayedAt = Date.now();
+        return entry;
+      });
+      replayed += 1;
+    } else {
+      await updateLockedReplay(marked.completionId, (entry) => {
+        if (entry.status === 'creating-replay') entry.status = 'pending';
+        return entry;
+      });
+    }
+  }
+  return { replayed, locked: false };
+}
+
+async function handleIdleStateChanged(state) {
+  if (state === 'locked') return { replayed: 0, locked: true };
+  return flushPendingLockedReplays();
+}
+
+async function reconcileLockedReplayQueue() {
+  const state = await queryIdleState();
+  if (state === 'locked' || state === 'unknown') return { replayed: 0, locked: state === 'locked' };
+  return flushPendingLockedReplays();
+}
+
 async function loadFinalizationStore() {
   if (!finalizationStorePromise) {
     finalizationStorePromise = sessionGet({ [FINALIZATION_STORAGE_KEY]: {} }).then((items) => {
@@ -334,18 +628,191 @@ async function loadFinalizationStore() {
   return finalizationStorePromise;
 }
 
-function mutateFinalization(tabId, updater) {
+function finalizationKey(tabId, pathHash) {
+  const safePathHash = String(pathHash || 'legacy').slice(0, 128);
+  return `${tabId}:${safePathHash}`;
+}
+
+function mutateFinalization(tabId, pathHash, updater) {
   const run = finalizationMutation.then(async () => {
     const store = await loadFinalizationStore();
-    const key = String(tabId);
+    const key = finalizationKey(tabId, pathHash);
     const previous = store[key] || null;
-    const result = updater(previous);
+    const result = updater(previous, store, key);
     if (result?.state) store[key] = result.state;
     else delete store[key];
     await sessionSet({ [FINALIZATION_STORAGE_KEY]: store });
     return { ...result, previous };
   });
   finalizationMutation = run.catch(() => undefined);
+  return run;
+}
+
+function queueFinalizationMutation(updater) {
+  const run = finalizationMutation.then(async () => {
+    const store = await loadFinalizationStore();
+    const result = await updater(store);
+    await sessionSet({ [FINALIZATION_STORAGE_KEY]: store });
+    return result;
+  });
+  finalizationMutation = run.catch(() => undefined);
+  return run;
+}
+
+function pendingRouteSummary(state) {
+  if (!state || state.notified || state.suspended) return null;
+  if (state.expiresAt && state.expiresAt <= Date.now()) return null;
+  return {
+    completionId: String(state.completionId || ''),
+    startedAt: Number(state.startedAt) || 0,
+    baselineUserCount: Number(state.baselineUserCount) || 0,
+    baselineAssistantCount: Number(state.baselineAssistantCount) || 0,
+    startSource: String(state.startSource || 'implicit'),
+    sawGenerating: state.sawGenerating === true,
+    phase: String(state.phase || 'waiting'),
+    expiresAt: Number(state.expiresAt) || 0,
+  };
+}
+
+async function activeFinalizationEntries() {
+  const store = await loadFinalizationStore();
+  const now = Date.now();
+  return Object.entries(store).filter(([, state]) => (
+    state
+    && !state.notified
+    && !state.suspended
+    && (!Number(state.expiresAt) || Number(state.expiresAt) > now)
+    && Number.isInteger(Number(state.tabId))
+    && String(state.pathHash || '')
+    && String(state.completionId || '')
+  ));
+}
+
+async function refreshWatchdogAlarm() {
+  if (!chrome.alarms?.create) return false;
+  const pending = await activeFinalizationEntries();
+  if (pending.length === 0) {
+    try { await chrome.alarms.clear(WATCHDOG_ALARM); } catch { /* optional on older builds */ }
+    return false;
+  }
+  try {
+    // One minute also respects pre-Chrome-120 builds, whose packaged alarms
+    // have a less predictable minimum period than current Chromium.
+    await chrome.alarms.create(WATCHDOG_ALARM, { delayInMinutes: 1, periodInMinutes: 1 });
+    return true;
+  } catch (error) {
+    console.warn('[TurnBell] watchdog alarm could not be scheduled', error);
+    return false;
+  }
+}
+
+async function runWatchdogAlarm() {
+  const pending = await activeFinalizationEntries();
+  if (pending.length === 0) {
+    await refreshWatchdogAlarm();
+    return;
+  }
+  for (const [, state] of pending) {
+    const message = {
+      type: 'monitor-sample-now',
+      reason: 'watchdog',
+      pathHash: state.pathHash,
+      routeEpoch: state.routeEpoch,
+      completionId: state.completionId,
+    };
+    const response = await sendTabMessageBounded(state.tabId, message);
+    void recordLifecycleDiagnostic({
+      type: 'watchdog-sample',
+      at: Date.now(),
+      pathHash: state.pathHash,
+      routeEpoch: state.routeEpoch,
+      lifecycle: response?.reason === 'route-not-mounted'
+        ? 'route-not-mounted'
+        : (response?.sampled === true ? 'sampled' : 'no-response'),
+    }, { tab: { id: state.tabId }, documentId: state.documentId });
+  }
+  await refreshWatchdogAlarm();
+}
+
+function clearSettleChecksForTab(tabId) {
+  for (const [key, pending] of settleChecks) {
+    if (!key.startsWith(`${tabId}:`)) continue;
+    clearTimeout(pending.timerId);
+    pending.resolve({ ok: false, cancelled: true, reason: 'tab-removed' });
+    settleChecks.delete(key);
+  }
+}
+
+async function hashDiagnosticId(value) {
+  const text = String(value || '');
+  if (!text) return '';
+  try {
+    if (globalThis.crypto?.subtle?.digest && typeof globalThis.TextEncoder === 'function') {
+      const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+      return [...new Uint8Array(digest)].slice(0, 16)
+        .map((byte) => byte.toString(16).padStart(2, '0')).join('');
+    }
+  } catch {
+    // Fall back to a short opaque diagnostic token in restricted runtimes.
+  }
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+function recordLifecycleDiagnostic(event = {}, sender = {}) {
+  const run = diagnosticMutation.then(async () => {
+    const items = await sessionGet({ [LIFECYCLE_DIAGNOSTICS_KEY]: [] });
+    const previous = Array.isArray(items[LIFECYCLE_DIAGNOSTICS_KEY])
+      ? items[LIFECYCLE_DIAGNOSTICS_KEY]
+      : [];
+    const allowedTypes = new Set([
+      'lifecycle-event', 'watchdog-sample', 'turn-start', 'turn-candidate', 'notification-created',
+    ]);
+    const allowedLifecycle = new Set([
+      'freeze', 'resume', 'visibilitychange', 'pageshow', 'pagehide', 'focus',
+      'sampled', 'no-response', 'route-not-mounted', 'candidate-sent', 'candidate-received',
+      'created', 'suppressed', 'failed',
+    ]);
+    const eventType = allowedTypes.has(String(event.type)) ? String(event.type) : 'lifecycle-event';
+    const safePathHash = /^[a-f0-9]{8,64}$/iu.test(String(event.pathHash || ''))
+      ? String(event.pathHash).slice(0, 64)
+      : '';
+    const entry = {
+      type: eventType,
+      at: Math.max(0, Number(event.at) || Date.now()),
+      observedAt: Math.max(0, Number(event.observedAt) || 0),
+      notificationCreatedAt: Math.max(0, Number(event.notificationCreatedAt) || 0),
+      tabId: Number.isInteger(sender?.tab?.id) ? sender.tab.id : null,
+      documentIdHash: await hashDiagnosticId(sender?.documentId),
+      pathHash: safePathHash,
+      routeEpoch: Math.max(0, Math.trunc(Number(event.routeEpoch) || 0)),
+      lifecycle: allowedLifecycle.has(String(event.lifecycle)) ? String(event.lifecycle) : '',
+      visibilityState: ['visible', 'hidden', 'prerender'].includes(String(event.visibilityState))
+        ? String(event.visibilityState)
+        : 'unknown',
+      wasDiscarded: event.wasDiscarded === true,
+      sampleCount: Math.max(0, Math.trunc(Number(event.sampleCount) || 0)),
+      mutationCount: Math.max(0, Math.trunc(Number(event.mutationCount) || 0)),
+      textRevisionCount: Math.max(0, Math.trunc(Number(event.textRevisionCount) || 0)),
+      timerTickCount: Math.max(0, Math.trunc(Number(event.timerTickCount) || 0)),
+      sampleGapMs: Math.max(0, Math.trunc(Number(event.sampleGapMs) || 0)),
+      assistantCount: Math.max(0, Math.trunc(Number(event.assistantCount) || 0)),
+      userCount: Math.max(0, Math.trunc(Number(event.userCount) || 0)),
+      isGenerating: event.isGenerating === true,
+      hasFinalAction: event.hasFinalAction === true,
+      detectorPhase: ['idle', 'waiting', 'generating', 'settling', 'complete'].includes(String(event.detectorPhase))
+        ? String(event.detectorPhase)
+        : '',
+    };
+    const next = [...previous, entry].slice(-200);
+    await sessionSet({ [LIFECYCLE_DIAGNOSTICS_KEY]: next });
+    return entry;
+  });
+  diagnosticMutation = run.catch(() => undefined);
   return run;
 }
 
@@ -357,73 +824,276 @@ async function notifyFromFinal(tabId, action, event = {}, rawContext = {}, force
   }
   const completedAt = Number(action?.completedAt) || Date.now();
   const startedAt = Math.min(Number(action?.startedAt) || completedAt, completedAt);
+  const completionId = String(action?.completionId || event?.completionId || '');
+  const locked = await queryIdleState() === 'locked';
   const payload = notificationAPI.makeNotificationPayload({
     durationMs: Math.max(0, completedAt - startedAt),
-    fingerprint: String(event.fingerprint || ''),
   }, context);
-  const routes = await routeNotification(payload, settings);
+  let lockItem = null;
+  let initialInFlight = false;
+  if (locked && completionId) {
+    const ids = lockNotificationIds(tabId, completionId);
+    payload.notificationId = ids.initial;
+    payload.webTag = ids.initialWebTag;
+    payload.completionId = completionId;
+    payload.notificationKind = 'locked-initial';
+    lockInitialNotificationsInFlight.add(completionId);
+    initialInFlight = true;
+    try {
+      lockItem = await enqueueLockedReplay({
+        completionId,
+        tabId,
+        completedAt,
+        durationMs: Math.max(0, completedAt - startedAt),
+        initialNotificationId: ids.initial,
+        replayNotificationId: ids.replay,
+        initialWebTag: ids.initialWebTag,
+        replayWebTag: ids.replayWebTag,
+      });
+    } catch (error) {
+      lockInitialNotificationsInFlight.delete(completionId);
+      initialInFlight = false;
+      throw error;
+    }
+  }
+  let routes;
+  try {
+    routes = await routeNotification(payload, settings);
+  } finally {
+    if (initialInFlight) lockInitialNotificationsInFlight.delete(completionId);
+  }
+  if (lockItem) {
+    await updateLockedReplay(completionId, (entry) => {
+      // An unlock handler may already have recovered and replayed this record.
+      // Only the creator that owns the initial state may advance it to pending.
+      if (entry.status === 'creating-initial') {
+        entry.status = 'pending';
+        entry.initialNotificationId = String(routes.notificationId || payload.notificationId || '');
+        entry.initialWebTag = String(routes.webTag || payload.webTag || '');
+      }
+      return entry;
+    });
+    if (await queryIdleState() !== 'locked') await flushPendingLockedReplays();
+  }
   return { ok: true, payload, routes };
 }
 
 async function handleTurnStart(message, sender) {
   const tabId = sender?.tab?.id;
   if (!Number.isInteger(tabId)) return { ok: false, error: 'missing-tab' };
-  const result = await mutateFinalization(tabId, (state) => finalizationAPI.beginTurn(state, {
+  const pathHash = String(message.pathHash || '');
+  const completionId = String(message.completionId || '');
+  if (!pathHash || !completionId) return { ok: false, error: 'missing-route-identity' };
+  const result = await mutateFinalization(tabId, pathHash, (state) => finalizationAPI.beginTurn(state, {
     tabId,
+    documentId: String(sender?.documentId || ''),
+    pathHash,
+    routeEpoch: Number(message.routeEpoch) || 0,
+    completionId,
     at: Number(message.at) || Date.now(),
-    turnKey: String(message.turnKey || ''),
+    startedAt: Number(message.startedAt) || Number(message.at) || Date.now(),
     userCount: Number(message.userCount) || 0,
+    assistantCount: Number(message.assistantCount) || 0,
     source: String(message.source || 'implicit'),
   }));
+  await refreshWatchdogAlarm();
+  void recordLifecycleDiagnostic({
+    type: 'turn-start', at: Number(message.at) || Date.now(), pathHash,
+    routeEpoch: Number(message.routeEpoch) || 0, lifecycle: 'candidate-received',
+  }, sender);
+  return { ok: true, action: result.action.type, reason: result.action.reason || '' };
+}
+
+async function handleTurnProgress(message, sender) {
+  const tabId = sender?.tab?.id;
+  const pathHash = String(message.pathHash || '');
+  if (!Number.isInteger(tabId) || !pathHash || !message.completionId) {
+    return { ok: false, error: 'missing-route-identity' };
+  }
+  const result = await mutateFinalization(tabId, pathHash, (rawState) => {
+    const state = finalizationAPI.normalizeState(rawState);
+    if (!state || state.completionId !== String(message.completionId)) {
+      return { state, action: { type: 'suppress', reason: 'completion-mismatch' } };
+    }
+    if (state.documentId && String(sender?.documentId || '') !== state.documentId) {
+      return { state, action: { type: 'suppress', reason: 'document-mismatch' } };
+    }
+    if (state.routeEpoch !== (Number(message.routeEpoch) || 0)) {
+      return { state, action: { type: 'suppress', reason: 'stale-route-epoch' } };
+    }
+    state.sawGenerating = state.sawGenerating || message.sawGenerating === true;
+    if (state.sawGenerating) state.phase = String(message.phase || 'generating');
+    state.lastActivityAt = Math.max(state.lastActivityAt, Number(message.at) || Date.now());
+    return { state, action: { type: 'updated' } };
+  });
+  return { ok: true, action: result.action.type, reason: result.action.reason || '' };
+}
+
+async function handleRouteEnter(message, sender) {
+  const tabId = sender?.tab?.id;
+  const pathHash = String(message.pathHash || '');
+  if (!Number.isInteger(tabId) || !pathHash) return { ok: false, error: 'missing-route-identity' };
+  const now = Date.now();
+  const result = await mutateFinalization(tabId, pathHash, (rawState) => {
+    const state = finalizationAPI.normalizeState(rawState);
+    if (!state || state.notified || (state.expiresAt && state.expiresAt <= now)) {
+      return { state: state?.notified ? state : null, action: { type: 'no-pending' } };
+    }
+    state.documentId = String(sender?.documentId || state.documentId);
+    state.routeEpoch = Math.max(0, Math.trunc(Number(message.routeEpoch) || 0));
+    state.suspended = false;
+    state.lastActivityAt = Math.max(state.lastActivityAt, now);
+    return { state, action: { type: 'pending', pending: pendingRouteSummary(state) } };
+  });
+  await refreshWatchdogAlarm();
+  return { ok: true, pending: result.action.pending || null };
+}
+
+async function handleRouteMove(message, sender) {
+  const tabId = sender?.tab?.id;
+  const fromPathHash = String(message.fromPathHash || '');
+  const toPathHash = String(message.pathHash || '');
+  const completionId = String(message.completionId || '');
+  if (!Number.isInteger(tabId) || !fromPathHash || !toPathHash || !completionId) {
+    return { ok: false, error: 'missing-route-identity' };
+  }
+  const result = await queueFinalizationMutation(async (store) => {
+    const fromKey = finalizationKey(tabId, fromPathHash);
+    const toKey = finalizationKey(tabId, toPathHash);
+    const prior = finalizationAPI.normalizeState(store[fromKey]);
+    const destination = finalizationAPI.normalizeState(store[toKey]);
+    if (prior?.completionId === completionId && !prior.notified) {
+      if (destination && !destination.notified && destination.completionId !== completionId) {
+        return { ok: false, reason: 'destination-active', pending: pendingRouteSummary(destination) };
+      }
+      prior.pathHash = toPathHash;
+      prior.documentId = String(sender?.documentId || prior.documentId);
+      prior.routeEpoch = Math.max(0, Math.trunc(Number(message.routeEpoch) || 0));
+      prior.suspended = false;
+      prior.lastActivityAt = Date.now();
+      delete store[fromKey];
+      store[toKey] = prior;
+      return { ok: true, pending: pendingRouteSummary(prior) };
+    }
+    if (destination && !destination.notified) {
+      destination.documentId = String(sender?.documentId || destination.documentId);
+      destination.routeEpoch = Math.max(0, Math.trunc(Number(message.routeEpoch) || 0));
+      destination.suspended = false;
+      store[toKey] = destination;
+      return { ok: true, pending: pendingRouteSummary(destination) };
+    }
+    return { ok: false, reason: 'source-turn-missing', pending: null };
+  });
+  await refreshWatchdogAlarm();
+  return result;
+}
+
+async function handleRouteSuspend(message, sender) {
+  const tabId = sender?.tab?.id;
+  const pathHash = String(message.pathHash || '');
+  if (!Number.isInteger(tabId) || !pathHash || !message.completionId) {
+    return { ok: false, error: 'missing-route-identity' };
+  }
+  const result = await mutateFinalization(tabId, pathHash, (rawState) => {
+    const state = finalizationAPI.normalizeState(rawState);
+    if (!state || state.completionId !== String(message.completionId)) {
+      return { state, action: { type: 'suppress', reason: 'completion-mismatch' } };
+    }
+    if (state.documentId && String(sender?.documentId || '') !== state.documentId) {
+      return { state, action: { type: 'suppress', reason: 'document-mismatch' } };
+    }
+    if (state.routeEpoch !== (Number(message.routeEpoch) || 0)) {
+      return { state, action: { type: 'suppress', reason: 'stale-route-epoch' } };
+    }
+    state.suspended = true;
+    state.lastActivityAt = Date.now();
+    return { state, action: { type: 'suspended' } };
+  });
+  await refreshWatchdogAlarm();
   return { ok: true, action: result.action.type, reason: result.action.reason || '' };
 }
 
 async function handleDomCandidate(message, sender) {
   const tabId = sender?.tab?.id;
   if (!Number.isInteger(tabId)) return { ok: false, error: 'missing-tab' };
+  const pathHash = String(message.pathHash || message?.payload?.pathHash || '');
+  const completionId = String(message.completionId || '');
+  if (!pathHash || !completionId) return { ok: false, error: 'missing-route-identity' };
   const event = message?.payload?.event || {};
   const context = message?.payload?.context || {};
   const hasFinalAction = event.hasFinalAction === true || context.hasFinalAction === true;
-  const result = await mutateFinalization(tabId, (state) => finalizationAPI.acceptDomCandidate(state, {
-    tabId,
-    at: Number(event.completedAt) || Number(message.at) || Date.now(),
-    startedAt: Number(event.startedAt) || 0,
-    turnKey: String(message.turnKey || context.turnKey || ''),
-    userCount: Number(context.userCount) || 0,
-    hasFinalAction,
-    finalEvidence: String(event.finalEvidence || (hasFinalAction ? 'final-action' : '')),
-    fingerprint: String(event.fingerprint || context.fingerprint || ''),
-  }));
+  const result = await mutateFinalization(tabId, pathHash, (state, store, currentKey) => {
+    const completionIsRoutedElsewhere = Object.entries(store).some(([key, rawState]) => (
+      key !== currentKey
+      && key.startsWith(`${tabId}:`)
+      && finalizationAPI.normalizeState(rawState)?.completionId === completionId
+    ));
+    if (completionIsRoutedElsewhere) {
+      return { state, action: { type: 'suppress', reason: 'completion-route-mismatch' } };
+    }
+    return finalizationAPI.acceptDomCandidate(state, {
+      tabId,
+      documentId: String(sender?.documentId || ''),
+      pathHash,
+      routeEpoch: Number(message.routeEpoch) || 0,
+      completionId,
+      at: Number(event.completedAt) || Number(message.at) || Date.now(),
+      startedAt: Number(event.startedAt) || 0,
+      userCount: Number(context.userCount) || 0,
+      assistantCount: Number(context.assistantCount) || 0,
+      hasFinalAction,
+      finalEvidence: String(event.finalEvidence || (hasFinalAction ? 'final-action' : '')),
+    });
+  });
+
+  void recordLifecycleDiagnostic({
+    type: 'turn-candidate', at: Date.now(), observedAt: Number(event.completedAt) || 0, pathHash,
+    routeEpoch: Number(message.routeEpoch) || 0,
+    lifecycle: result.action.type === 'notify' ? 'candidate-received' : 'suppressed',
+  }, sender);
 
   if (result.action.type !== 'notify') {
     return { ok: true, suppressed: true, reason: result.action.reason || 'not-final' };
   }
-  return notifyFromFinal(tabId, result.action, event, context);
+  const response = await notifyFromFinal(tabId, result.action, event, context);
+  void recordLifecycleDiagnostic({
+    type: 'notification-created', at: Date.now(), observedAt: Number(event.completedAt) || 0,
+    notificationCreatedAt: Number(response?.routes?.notificationCreatedAt) || 0,
+    pathHash, routeEpoch: Number(message.routeEpoch) || 0,
+    lifecycle: response?.routes?.browser || response?.routes?.web ? 'created' : 'failed',
+  }, sender);
+  await refreshWatchdogAlarm();
+  return response;
 }
 
 function scheduleSettleCheck(message, sender) {
   const tabId = sender?.tab?.id;
   if (!Number.isInteger(tabId)) return Promise.resolve({ ok: false, error: 'missing-tab' });
-  const previous = settleChecks.get(tabId);
+  const pathHash = String(message.pathHash || '');
+  const routeKey = finalizationKey(tabId, pathHash);
+  const previous = settleChecks.get(routeKey);
   if (previous) {
     clearTimeout(previous.timerId);
     previous.resolve({ ok: true, cancelled: true, reason: 'superseded' });
-    settleChecks.delete(tabId);
+    settleChecks.delete(routeKey);
   }
 
   const rawDelay = Number(message.delayMs);
   const delayMs = Number.isFinite(rawDelay) ? Math.min(10_000, Math.max(200, Math.round(rawDelay))) : 1_200;
   return new Promise((resolve) => {
     const timerId = setTimeout(async () => {
-      settleChecks.delete(tabId);
-      const response = await sendTabMessage(tabId, {
+      settleChecks.delete(routeKey);
+      const response = await sendTabMessageBounded(tabId, {
         type: 'monitor-sample-now',
+        pathHash,
+        routeEpoch: Number(message.routeEpoch) || 0,
+        completionId: String(message.completionId || ''),
         cycleNumber: Number.isInteger(message.cycleNumber) ? message.cycleNumber : null,
         settleKey: String(message.settleKey || ''),
       });
-      resolve({ ok: true, sampled: Boolean(response?.ok), response });
+      resolve({ ok: true, sampled: response?.sampled === true, stale: response?.stale === true, response });
     }, delayMs);
-    settleChecks.set(tabId, { timerId, resolve });
+    settleChecks.set(routeKey, { timerId, resolve });
   });
 }
 
@@ -484,15 +1154,41 @@ async function monitorStatus() {
 }
 
 async function removeTabState(tabId) {
-  await mutateFinalization(tabId, () => ({ state: null, action: { type: 'removed' } }));
+  await queueFinalizationMutation(async (store) => {
+    for (const key of Object.keys(store)) {
+      if (key.startsWith(`${tabId}:`)) delete store[key];
+    }
+    return { ok: true };
+  });
+  clearSettleChecksForTab(tabId);
+  await refreshWatchdogAlarm();
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  void (async () => { await ensureDefaultSettings(); await injectExistingChatGPTTabs(); })();
+  void (async () => {
+    await ensureDefaultSettings();
+    await injectExistingChatGPTTabs();
+    await refreshWatchdogAlarm();
+    await reconcileLockedReplayQueue();
+  })();
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  void (async () => { await ensureDefaultSettings(); await injectExistingChatGPTTabs(); })();
+  void (async () => {
+    await ensureDefaultSettings();
+    await injectExistingChatGPTTabs();
+    await refreshWatchdogAlarm();
+    await reconcileLockedReplayQueue();
+  })();
+});
+
+chrome.alarms?.onAlarm?.addListener((alarm) => {
+  if (alarm?.name === WATCHDOG_ALARM) void runWatchdogAlarm();
+});
+
+chrome.idle?.setDetectionInterval?.(15);
+chrome.idle?.onStateChanged?.addListener((state) => {
+  void handleIdleStateChanged(String(state || 'unknown'));
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -501,10 +1197,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     switch (message.type) {
       case 'turn-start':
         return handleTurnStart(message, sender);
+      case 'turn-progress':
+        return handleTurnProgress(message, sender);
+      case 'route-enter':
+        return handleRouteEnter(message, sender);
+      case 'turn-move':
+        return handleRouteMove(message, sender);
+      case 'turn-suspend':
+        return handleRouteSuspend(message, sender);
       case 'dom-final-candidate':
         return handleDomCandidate(message, sender);
       case 'schedule-settle-check':
         return scheduleSettleCheck(message, sender);
+      case 'lifecycle-event':
+        await recordLifecycleDiagnostic(message, sender);
+        return { ok: true };
       case 'test-notification': {
         const settings = notificationAPI.normalizeSettings(message.settings || {});
         const context = await resolvedContext(sender?.tab?.id, {
@@ -532,8 +1239,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           webPermission: String(globalThis.Notification?.permission || 'unknown'),
         };
       case 'notification-diagnostics': {
-        const items = await sessionGet({ [LAST_DIAGNOSTIC_KEY]: null });
-        return { ok: true, diagnostic: items[LAST_DIAGNOSTIC_KEY] };
+        const items = await sessionGet({ [LAST_DIAGNOSTIC_KEY]: null, [LIFECYCLE_DIAGNOSTICS_KEY]: [] });
+        return {
+          ok: true,
+          diagnostic: items[LAST_DIAGNOSTIC_KEY],
+          lifecycleEvents: Array.isArray(items[LIFECYCLE_DIAGNOSTICS_KEY])
+            ? items[LIFECYCLE_DIAGNOSTICS_KEY]
+            : [],
+        };
       }
       case 'monitor-status':
         return monitorStatus();
@@ -559,6 +1272,7 @@ if (typeof globalThis.addEventListener === 'function') {
     event?.notification?.close?.();
     const work = Promise.resolve().then(() => {
       const tabId = Number(data.tabId);
+      if (data.completionId) void acknowledgeLockedReplay(String(data.completionId));
       if (Number.isInteger(tabId)) void clearCompletionBadge(tabId);
       openChatGPT(Number.isInteger(tabId) ? tabId : null);
     });
@@ -566,12 +1280,25 @@ if (typeof globalThis.addEventListener === 'function') {
   });
 }
 
+function parseLockedNotificationId(notificationId) {
+  const match = new RegExp(`^${NOTIFICATION_PREFIX}(\\d+)-lock-([a-z0-9-]+)-(?:initial|unlock)$`, 'iu')
+    .exec(String(notificationId || ''));
+  return match ? { tabId: Number(match[1]), completionId: match[2] } : null;
+}
+
 chrome.notifications.onClicked.addListener((notificationId) => {
+  const locked = parseLockedNotificationId(notificationId);
   const match = new RegExp(`^${NOTIFICATION_PREFIX}(\\d+)-`).exec(notificationId);
-  const tabId = match ? Number(match[1]) : null;
+  const tabId = locked?.tabId ?? (match ? Number(match[1]) : null);
+  if (locked) void acknowledgeLockedReplay(locked.completionId);
   if (Number.isInteger(tabId)) void clearCompletionBadge(tabId);
   openChatGPT(tabId);
-  chrome.notifications.clear(notificationId);
+  void clearNotification(notificationId);
+});
+
+chrome.notifications.onClosed?.addListener((notificationId, byUser) => {
+  const locked = parseLockedNotificationId(notificationId);
+  if (locked && byUser === true) void acknowledgeLockedReplay(locked.completionId);
 });
 
 chrome.tabs.onActivated.addListener((activeInfo) => {
@@ -579,11 +1306,5 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  const pending = settleChecks.get(tabId);
-  if (pending) {
-    clearTimeout(pending.timerId);
-    pending.resolve({ ok: false, cancelled: true, reason: 'tab-removed' });
-    settleChecks.delete(tabId);
-  }
   void removeTabState(tabId);
 });

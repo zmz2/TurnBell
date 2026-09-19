@@ -23,8 +23,9 @@ test('manifest is a local-code Manifest V3 extension for ChatGPT', () => {
   assert.ok(manifest.permissions.includes('storage'));
   assert.ok(manifest.permissions.includes('offscreen'));
   assert.ok(manifest.permissions.includes('scripting'));
+  assert.ok(manifest.permissions.includes('idle'));
+  assert.ok(manifest.permissions.includes('alarms'));
   assert.ok(!manifest.permissions.includes('webRequest'));
-  assert.ok(!manifest.permissions.includes('alarms'));
   assert.ok(!manifest.host_permissions.includes('http://127.0.0.1/*'));
 
   const matches = manifest.content_scripts.flatMap((entry) => entry.matches);
@@ -81,7 +82,9 @@ test('background loads only DOM completion and notification cores', () => {
   const background = fs.readFileSync(path.join(extensionRoot, 'src/background.js'), 'utf8');
   assert.match(background, /importScripts\([^)]*tab-monitor-core\.js/);
   assert.match(background, /importScripts\([^)]*finalization-core\.js/);
-  assert.doesNotMatch(background, /network-core\.js|stream-final|webRequest|main-world-stream|chrome\.alarms/u);
+  assert.match(background, /chrome\.alarms/u);
+  assert.match(background, /chrome\.idle/u);
+  assert.doesNotMatch(background, /network-core\.js|stream-final|webRequest|main-world-stream/u);
 });
 
 test('extension HTML does not load remote code', () => {

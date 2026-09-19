@@ -22,14 +22,21 @@
     return {
       tabId: Number.isInteger(raw.tabId) ? raw.tabId : null,
       cycleNumber: Math.max(1, Math.trunc(finite(raw.cycleNumber, 1))),
-      turnKey: String(raw.turnKey || ''),
+      documentId: String(raw.documentId || ''),
+      pathHash: String(raw.pathHash || ''),
+      routeEpoch: Math.max(0, Math.trunc(finite(raw.routeEpoch, 0))),
+      completionId: String(raw.completionId || ''),
       startSource: normalizeSource(raw.startSource),
-      userCount: Math.max(0, Math.trunc(finite(raw.userCount, 0))),
+      baselineUserCount: Math.max(0, Math.trunc(finite(raw.baselineUserCount, 0))),
+      baselineAssistantCount: Math.max(0, Math.trunc(finite(raw.baselineAssistantCount, 0))),
       startedAt: Math.max(0, finite(raw.startedAt, 0)),
       lastActivityAt: Math.max(0, finite(raw.lastActivityAt, 0)),
+      phase: String(raw.phase || 'waiting'),
+      sawGenerating: Boolean(raw.sawGenerating),
+      suspended: Boolean(raw.suspended),
+      expiresAt: Math.max(0, finite(raw.expiresAt, 0)),
       notified: Boolean(raw.notified),
       notifiedAt: Math.max(0, finite(raw.notifiedAt, 0)),
-      fingerprint: String(raw.fingerprint || ''),
     };
   }
 
@@ -41,24 +48,44 @@
     return {
       tabId: Number.isInteger(event.tabId) ? event.tabId : prior?.tabId ?? null,
       cycleNumber: (prior?.cycleNumber || 0) + 1,
-      turnKey: String(event.turnKey || ''),
+      documentId: String(event.documentId || ''),
+      pathHash: String(event.pathHash || ''),
+      routeEpoch: Math.max(0, Math.trunc(finite(event.routeEpoch, 0))),
+      completionId: String(event.completionId || ''),
       startSource: normalizeSource(event.source),
-      userCount: Math.max(0, Math.trunc(finite(event.userCount, 0))),
+      baselineUserCount: Math.max(0, Math.trunc(finite(event.userCount, 0))),
+      baselineAssistantCount: Math.max(0, Math.trunc(finite(event.assistantCount, 0))),
       startedAt,
       lastActivityAt: at,
+      phase: 'waiting',
+      sawGenerating: false,
+      suspended: false,
+      expiresAt: Math.max(at, finite(event.expiresAt, at + 24 * 60 * 60 * 1_000)),
       notified: false,
       notifiedAt: 0,
-      fingerprint: '',
     };
   }
 
   function beginTurn(rawState, event = {}) {
     const state = normalizeState(rawState);
-    const turnKey = String(event.turnKey || '');
-    if (state && turnKey && state.turnKey === turnKey) {
-      return { state, action: { type: 'noop', reason: 'same-turn' } };
+    const completionId = String(event.completionId || '');
+    if (state && completionId && state.completionId === completionId) {
+      if (state.notified) return { state, action: { type: 'noop', reason: 'already-notified' } };
+      state.documentId = String(event.documentId || state.documentId);
+      state.pathHash = String(event.pathHash || state.pathHash);
+      state.routeEpoch = Math.max(state.routeEpoch, Math.trunc(finite(event.routeEpoch, state.routeEpoch)));
+      state.startSource = state.startSource === 'explicit' || normalizeSource(event.source) === 'explicit'
+        ? 'explicit'
+        : 'implicit';
+      state.baselineUserCount = Math.max(state.baselineUserCount, Math.trunc(finite(event.userCount, state.baselineUserCount)));
+      state.baselineAssistantCount = Math.max(state.baselineAssistantCount, Math.trunc(finite(event.assistantCount, state.baselineAssistantCount)));
+      state.startedAt = Math.min(state.startedAt || Number.MAX_SAFE_INTEGER, Math.max(0, finite(event.startedAt, state.startedAt)));
+      if (!Number.isFinite(state.startedAt) || state.startedAt === Number.MAX_SAFE_INTEGER) state.startedAt = Math.max(0, finite(event.at, Date.now()));
+      state.lastActivityAt = Math.max(state.lastActivityAt, Math.max(0, finite(event.at, Date.now())));
+      state.suspended = false;
+      return { state, action: { type: 'update', reason: 'same-completion' } };
     }
-    return { state: newState(state, event), action: { type: 'new-turn' } };
+    return { state: newState(state, { ...event, completionId }), action: { type: 'new-turn' } };
   }
 
   function ensureState(rawState, event = {}) {
@@ -66,12 +93,31 @@
   }
 
   function acceptDomCandidate(rawState, event = {}) {
-    let state = ensureState(rawState, event);
+    const state = ensureState(rawState, event);
+    if (!state.completionId || !event.completionId || state.completionId !== String(event.completionId)) {
+      return { state, action: { type: 'suppress', reason: 'completion-mismatch' } };
+    }
+    if (state.documentId && String(event.documentId || '') !== state.documentId) {
+      return { state, action: { type: 'suppress', reason: 'document-mismatch' } };
+    }
+    if (state.pathHash && String(event.pathHash || '') !== state.pathHash) {
+      return { state, action: { type: 'suppress', reason: 'route-mismatch' } };
+    }
+    if (state.routeEpoch && Math.trunc(finite(event.routeEpoch, 0)) !== state.routeEpoch) {
+      return { state, action: { type: 'suppress', reason: 'stale-route-epoch' } };
+    }
+    if (state.suspended) return { state, action: { type: 'suppress', reason: 'route-suspended' } };
+    const candidateAt = Math.max(0, finite(event.at, Date.now()));
+    if (state.expiresAt && state.expiresAt <= candidateAt) {
+      return { state, action: { type: 'suppress', reason: 'expired-turn' } };
+    }
+
     const hasFinalAction = event.hasFinalAction === true;
     const finalEvidence = hasFinalAction ? 'final-action' : String(event.finalEvidence || '');
     const trustedActionlessFinal = (
       finalEvidence === 'explicit-fast-stable'
       && state.startSource === 'explicit'
+      && state.sawGenerating !== true
     );
     if (!hasFinalAction && !trustedActionlessFinal) {
       return {
@@ -85,27 +131,16 @@
       };
     }
 
-    const eventTurnKey = String(event.turnKey || '');
-    if (state.turnKey && eventTurnKey && state.turnKey !== eventTurnKey) {
-      const eventStartedAt = Math.max(0, finite(event.startedAt, 0));
-      const eventUserCount = Math.max(0, Math.trunc(finite(event.userCount, 0)));
-      const demonstrablyNewer = (eventStartedAt > state.startedAt) || (eventUserCount > state.userCount);
-      if (!demonstrablyNewer) {
-        return { state, action: { type: 'suppress', reason: 'stale-turn-key' } };
-      }
-      state = newState(state, event);
-    }
-
     if (state.notified) {
       return { state, action: { type: 'suppress', reason: 'already-notified' } };
     }
 
-    const at = Math.max(state.lastActivityAt, finite(event.at, Date.now()));
-    if (!state.turnKey && eventTurnKey) state.turnKey = eventTurnKey;
+    const at = Math.max(state.lastActivityAt, candidateAt);
     state.lastActivityAt = at;
     state.notified = true;
     state.notifiedAt = at;
-    state.fingerprint = String(event.fingerprint || '');
+    state.phase = 'complete';
+    state.suspended = false;
     return {
       state,
       action: {
@@ -114,6 +149,7 @@
         cycleNumber: state.cycleNumber,
         startedAt: state.startedAt,
         completedAt: at,
+        completionId: state.completionId,
       },
     };
   }

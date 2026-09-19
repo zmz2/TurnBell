@@ -8,81 +8,95 @@ const {
   normalizeState,
 } = require('../src/finalization-core.js');
 
+const IDENTITY = {
+  tabId: 42,
+  documentId: 'document-1',
+  pathHash: 'a'.repeat(32),
+  routeEpoch: 3,
+  completionId: 'completion-1',
+};
+
 function firstTurn(source = 'explicit') {
   return beginTurn(null, {
-    tabId: 42,
+    ...IDENTITY,
     at: 1_000,
-    turnKey: 'turn-1',
+    startedAt: 900,
     userCount: 1,
+    assistantCount: 0,
     source,
   }).state;
 }
 
-test('beginTurn creates a cycle, ignores the same key, and advances on a new key', () => {
-  const first = beginTurn(null, { tabId: 42, at: 1_000, turnKey: 'turn-1', userCount: 1 });
-  const same = beginTurn(first.state, { tabId: 42, at: 1_100, turnKey: 'turn-1', userCount: 1 });
-  const second = beginTurn(first.state, { tabId: 42, at: 2_000, turnKey: 'turn-2', userCount: 2 });
+function candidate(overrides = {}) {
+  return {
+    ...IDENTITY,
+    at: 3_000,
+    hasFinalAction: true,
+    finalEvidence: 'final-action',
+    ...overrides,
+  };
+}
+
+test('beginTurn stores route-scoped opaque identity and reuses the same completion id', () => {
+  const first = beginTurn(null, { ...IDENTITY, at: 1_000, startedAt: 900, userCount: 1 });
+  const same = beginTurn(first.state, { ...IDENTITY, at: 1_100, startedAt: 950, userCount: 2 });
 
   assert.equal(first.state.cycleNumber, 1);
-  assert.equal(same.action.reason, 'same-turn');
+  assert.equal(first.state.completionId, 'completion-1');
+  assert.equal(same.action.reason, 'same-completion');
   assert.equal(same.state.cycleNumber, 1);
-  assert.equal(second.state.cycleNumber, 2);
-  assert.equal(second.state.notified, false);
+  assert.equal(same.state.startedAt, 900);
+  assert.equal(same.state.baselineUserCount, 2);
 });
 
-test('DOM progress without a final action row never completes a turn', () => {
-  const result = acceptDomCandidate(firstTurn(), {
-    at: 3_000,
-    turnKey: 'turn-1',
-    hasFinalAction: false,
-    fingerprint: 'recap',
-  });
+test('a candidate requires matching document, path, route epoch, and completion id', () => {
+  const state = firstTurn();
+  for (const [override, reason] of [
+    [{ documentId: 'other-document' }, 'document-mismatch'],
+    [{ pathHash: 'b'.repeat(32) }, 'route-mismatch'],
+    [{ routeEpoch: 2 }, 'stale-route-epoch'],
+    [{ completionId: 'other-completion' }, 'completion-mismatch'],
+  ]) {
+    const result = acceptDomCandidate(state, candidate(override));
+    assert.equal(result.action.type, 'suppress');
+    assert.equal(result.action.reason, reason);
+    assert.equal(result.state.notified, false);
+  }
+});
+
+test('progress without trusted final evidence never completes a turn', () => {
+  const result = acceptDomCandidate(firstTurn(), candidate({ hasFinalAction: false, finalEvidence: '' }));
   assert.equal(result.action.type, 'suppress');
   assert.equal(result.action.reason, 'not-final-render');
   assert.equal(result.state.notified, false);
 });
 
-
-
-test('an explicit Instant-style turn accepts stable actionless final evidence', () => {
-  const result = acceptDomCandidate(firstTurn('explicit'), {
-    at: 4_000,
-    turnKey: 'turn-1',
+test('actionless final evidence is accepted only for explicit turns without generation evidence', () => {
+  const explicit = acceptDomCandidate(firstTurn('explicit'), candidate({
     hasFinalAction: false,
     finalEvidence: 'explicit-fast-stable',
-    fingerprint: 'instant-final',
-  });
-  assert.equal(result.action.type, 'notify');
-  assert.equal(result.action.source, 'dom-fast-final');
-  assert.equal(result.state.notified, true);
-});
+  }));
+  assert.equal(explicit.action.type, 'notify');
+  assert.equal(explicit.action.source, 'dom-fast-final');
 
-test('actionless final evidence is rejected unless the turn was explicitly started', () => {
-  const result = acceptDomCandidate(firstTurn('implicit'), {
-    at: 4_000,
-    turnKey: 'turn-1',
+  const implicit = acceptDomCandidate(firstTurn('implicit'), candidate({
     hasFinalAction: false,
     finalEvidence: 'explicit-fast-stable',
-    fingerprint: 'historical-or-implicit',
-  });
-  assert.equal(result.action.type, 'suppress');
-  assert.equal(result.action.reason, 'untrusted-actionless-final');
-  assert.equal(result.state.notified, false);
+  }));
+  assert.equal(implicit.action.reason, 'untrusted-actionless-final');
+
+  const generated = firstTurn('explicit');
+  generated.sawGenerating = true;
+  const generatedResult = acceptDomCandidate(generated, candidate({
+    hasFinalAction: false,
+    finalEvidence: 'explicit-fast-stable',
+  }));
+  assert.equal(generatedResult.action.reason, 'untrusted-actionless-final');
 });
 
-test('one final DOM candidate notifies once and duplicate evidence is suppressed', () => {
-  const first = acceptDomCandidate(firstTurn(), {
-    at: 3_000,
-    turnKey: 'turn-1',
-    hasFinalAction: true,
-    fingerprint: 'final-1',
-  });
-  const duplicate = acceptDomCandidate(first.state, {
-    at: 3_200,
-    turnKey: 'turn-1',
-    hasFinalAction: true,
-    fingerprint: 'final-1',
-  });
+test('one final candidate notifies once and duplicate evidence stays suppressed', () => {
+  const first = acceptDomCandidate(firstTurn(), candidate());
+  const duplicate = acceptDomCandidate(first.state, candidate({ at: 3_200 }));
 
   assert.equal(first.action.type, 'notify');
   assert.equal(first.action.source, 'dom-final');
@@ -91,120 +105,53 @@ test('one final DOM candidate notifies once and duplicate evidence is suppressed
   assert.equal(duplicate.action.reason, 'already-notified');
 });
 
-test('a different final turn key recovers when its explicit turn-start event was missed', () => {
-  const notified = acceptDomCandidate(firstTurn(), {
-    at: 3_000,
-    turnKey: 'turn-1',
-    hasFinalAction: true,
-    fingerprint: 'final-1',
-  }).state;
-  const next = acceptDomCandidate(notified, {
-    tabId: 42,
-    at: 7_000,
-    turnKey: 'turn-2',
-    userCount: 2,
-    hasFinalAction: true,
-    fingerprint: 'final-2',
-  });
+test('suspended and expired turns cannot be finalized', () => {
+  const suspended = firstTurn();
+  suspended.suspended = true;
+  const suspendedResult = acceptDomCandidate(suspended, candidate());
+  assert.equal(suspendedResult.action.reason, 'route-suspended');
 
-  assert.equal(next.action.type, 'notify');
-  assert.equal(next.state.cycleNumber, 2);
-  assert.equal(next.state.turnKey, 'turn-2');
-  assert.equal(next.state.fingerprint, 'final-2');
+  const expired = firstTurn();
+  expired.expiresAt = 2_000;
+  const expiredResult = acceptDomCandidate(expired, candidate({ at: 3_000 }));
+  assert.equal(expiredResult.action.reason, 'expired-turn');
 });
 
-test('a delayed candidate from an older key cannot complete the currently active turn', () => {
-  const activeSecond = beginTurn(firstTurn(), {
-    tabId: 42,
-    at: 4_000,
-    turnKey: 'turn-2',
-    userCount: 2,
-  }).state;
-  const stale = acceptDomCandidate(activeSecond, {
-    startedAt: 1_000,
-    at: 4_100,
-    turnKey: 'turn-1',
-    hasFinalAction: true,
-    fingerprint: 'late-first',
-  });
-
-  assert.equal(stale.action.type, 'suppress');
-  assert.equal(stale.action.reason, 'stale-turn-key');
-  assert.equal(stale.state.notified, false);
-  assert.equal(stale.state.turnKey, 'turn-2');
-});
-
-test('normalizeState strips malformed fields and preserves only the DOM ledger', () => {
+test('normalizeState retains only minimal completion metadata', () => {
   assert.equal(normalizeState(null), null);
   const state = normalizeState({
-    tabId: 7,
+    ...IDENTITY,
     cycleNumber: -2,
-    turnKey: 123,
-    userCount: -1,
+    source: 'explicit',
+    baselineUserCount: -1,
+    baselineAssistantCount: 2,
     startedAt: 'bad',
     notified: 1,
     notifiedAt: 9,
-    fingerprint: 456,
+    turnKey: 'must-not-survive',
+    fingerprint: 'must-not-survive',
+    answer: 'must-not-survive',
+    title: 'must-not-survive',
     activeRequestIds: ['must-not-survive'],
   });
   assert.deepEqual(state, {
-    tabId: 7,
+    tabId: 42,
     cycleNumber: 1,
-    turnKey: '123',
+    documentId: 'document-1',
+    pathHash: 'a'.repeat(32),
+    routeEpoch: 3,
+    completionId: 'completion-1',
     startSource: 'implicit',
-    userCount: 0,
+    baselineUserCount: 0,
+    baselineAssistantCount: 2,
     startedAt: 0,
     lastActivityAt: 0,
+    phase: 'waiting',
+    sawGenerating: false,
+    suspended: false,
+    expiresAt: 0,
     notified: true,
     notifiedAt: 9,
-    fingerprint: '456',
   });
-});
-
-
-test('a newer final candidate recovers from an unnotified stale start record', () => {
-  const staleStart = beginTurn(null, {
-    tabId: 42,
-    at: 1_000,
-    turnKey: 'false-ui-intent',
-    userCount: 1,
-  }).state;
-  const recovered = acceptDomCandidate(staleStart, {
-    tabId: 42,
-    startedAt: 5_000,
-    at: 8_000,
-    turnKey: 'real-turn-2',
-    userCount: 1,
-    hasFinalAction: true,
-    fingerprint: 'final-real',
-  });
-
-  assert.equal(recovered.action.type, 'notify');
-  assert.equal(recovered.state.turnKey, 'real-turn-2');
-  assert.equal(recovered.state.startedAt, 5_000);
-  assert.equal(recovered.action.startedAt, 5_000);
-});
-
-
-test('a different-key duplicate for an already notified turn stays suppressed', () => {
-  const notified = acceptDomCandidate(firstTurn(), {
-    startedAt: 1_000,
-    at: 3_000,
-    turnKey: 'turn-1',
-    userCount: 1,
-    hasFinalAction: true,
-    fingerprint: 'final-1',
-  }).state;
-  const duplicateAlias = acceptDomCandidate(notified, {
-    startedAt: 1_000,
-    at: 3_200,
-    turnKey: 'turn-1-alternate-dom-key',
-    userCount: 1,
-    hasFinalAction: true,
-    fingerprint: 'final-1',
-  });
-
-  assert.equal(duplicateAlias.action.type, 'suppress');
-  assert.equal(duplicateAlias.action.reason, 'stale-turn-key');
-  assert.equal(duplicateAlias.state.cycleNumber, 1);
+  assert.equal(JSON.stringify(state).includes('must-not-survive'), false);
 });

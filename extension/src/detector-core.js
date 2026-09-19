@@ -55,7 +55,7 @@
   }
 
   function createDetector(rawOptions = {}) {
-    const options = normalizeOptions(rawOptions);
+    let options = normalizeOptions(rawOptions);
     let state;
 
     function initialState() {
@@ -271,11 +271,16 @@
       return { ...state, options: { ...options } };
     }
 
+    function updateOptions(nextOptions = {}) {
+      options = normalizeOptions({ ...options, ...nextOptions });
+      return getState();
+    }
+
     function reset() {
       state = initialState();
     }
 
-    return Object.freeze({ step, arm, getState, reset });
+    return Object.freeze({ step, arm, getState, reset, updateOptions });
   }
 
   return Object.freeze({ createDetector, fingerprint, normalizeOptions });

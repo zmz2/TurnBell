@@ -9,7 +9,7 @@ Scope
 
 Source verification
 - node --test extension/tests/*.test.js
-  Result: PASS, 93 tests, 0 failures.
+  Result: PASS, 139 tests, 0 failures.
 - node --check on every JavaScript file in extension/src.
   Result: PASS.
 - python -m unittest discover -s scripts/tests -v
@@ -34,6 +34,19 @@ Regression coverage added for 1.5.1
   deliberate navigation to an existing conversation suspends it.
 - A same-count regenerated reply can recover after A→B→A when its in-memory
   fingerprint changed and final-render evidence remains stable.
+- Rapid route changes keep source DOM bound to its originating path, recover a
+  pending destination completion after A→B→A, and allow an explicit new turn
+  while old route nodes remain mounted.
+- A stale-epoch final candidate stays queued for route recovery; route-enter
+  storage failures retry, and an Instant completion can migrate when the user,
+  answer, and permanent URL appear in one sample.
+- An unfinished turn remains finalizable after a newer turn claims the same
+  route; a delayed route move from an older document cannot reclaim it.
+- Unlock replay claims the latest queue state after querying notification
+  activity, and dismissal acknowledgement retries after transient local or
+  session storage failures until both locked notification IDs are cleaned up.
+- Updating an unrelated sync setting preserves an explicitly armed detector
+  wait through its Instant completion.
 - Notification retry state does not persist page titles, URLs, reply text, or
   fingerprints; Web Notification data does not contain a URL.
 

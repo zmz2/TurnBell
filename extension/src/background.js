@@ -37,6 +37,7 @@ let workerRecoveryPromise = null;
 let watchdogAlarmKnown = false;
 const lockInitialNotificationsInFlight = new Set();
 const notificationDeliveriesInFlight = new Map();
+const pendingLockedReplayAcknowledgements = new Set();
 
 function storageGet(defaults) {
   return new Promise((resolve) => {
@@ -588,15 +589,37 @@ async function clearReplayPair(item) {
 }
 
 async function acknowledgeLockedReplay(completionId) {
-  const item = await updateLockedReplay(completionId, (entry) => {
-    const newlyAcknowledged = entry.status !== 'acknowledged';
-    entry.status = 'acknowledged';
-    if (newlyAcknowledged) entry.acknowledgedAt = Date.now();
-    return { ...entry, newlyAcknowledged };
-  });
-  if (item?.newlyAcknowledged) {
-    await markNotificationDeliveredByCompletion(item.tabId, completionId);
+  const id = String(completionId || '');
+  if (!id) return false;
+  pendingLockedReplayAcknowledgements.add(id);
+  try {
+    const item = await updateLockedReplay(id, (entry) => {
+      if (entry.status !== 'acknowledged') {
+        entry.status = 'acknowledged';
+        entry.acknowledgedAt = Date.now();
+        entry.cleanupComplete = false;
+      }
+      return { ...entry };
+    });
+    if (!item) {
+      pendingLockedReplayAcknowledgements.delete(id);
+      return false;
+    }
+    await markNotificationDeliveredByCompletion(item.tabId, id);
     await clearReplayPair(item);
+    await updateLockedReplay(id, (entry) => {
+      if (entry.status === 'acknowledged') entry.cleanupComplete = true;
+      return entry;
+    });
+    pendingLockedReplayAcknowledgements.delete(id);
+    return true;
+  } catch (error) {
+    // Keep the in-memory intent until the next alarm/unlock pass can persist
+    // it. This prevents a transient storage failure from turning a user
+    // dismissal into an unlock replay while the worker remains alive.
+    await refreshWatchdogAlarm();
+    throw error;
+  } finally {
     await refreshWatchdogAlarm();
   }
 }
@@ -628,7 +651,11 @@ async function pendingReplayItems() {
   return withLockReplayMutation((queue) => {
     pruneLockReplayQueue(queue);
     return queue
-      .filter((item) => ['creating-initial', 'initial-active', 'pending', 'creating-replay'].includes(String(item.status)))
+      .filter((item) => (
+        ['creating-initial', 'initial-active', 'pending', 'creating-replay'].includes(String(item.status))
+        || (item.status === 'acknowledged' && item.cleanupComplete !== true)
+        || pendingLockedReplayAcknowledgements.has(String(item.completionId || ''))
+      ))
       .map((item) => ({ ...item }));
   });
 }
@@ -651,6 +678,11 @@ async function performPendingLockedReplayFlush() {
   for (const snapshot of items) {
     if (await queryIdleState() === 'locked') return { replayed, locked: true };
     if (snapshot.expiresAt && snapshot.expiresAt <= Date.now()) continue;
+    if (snapshot.status === 'acknowledged' || pendingLockedReplayAcknowledgements.has(snapshot.completionId)) {
+      try { await acknowledgeLockedReplay(snapshot.completionId); }
+      catch (error) { console.warn('[TurnBell] locked replay acknowledgement retry failed', error); }
+      continue;
+    }
     // A live request may still be creating the original notification. After a
     // worker restart this in-memory marker is gone, so the orphan is recovered.
     if (snapshot.status === 'creating-initial') {
@@ -717,9 +749,18 @@ async function performPendingLockedReplayFlush() {
     if (!tabClosed && Number.isInteger(snapshot.tabId)) tabClosed = !(await getTab(snapshot.tabId));
     const marked = await updateLockedReplay(snapshot.completionId, (entry) => {
       if (!['creating-initial', 'initial-active', 'pending', 'creating-replay'].includes(String(entry.status))) return null;
+      const claimNow = Date.now();
+      if (entry.status === 'creating-initial') {
+        const initialAttemptAt = Number(entry.initialAttemptAt) || 0;
+        if (lockInitialNotificationsInFlight.has(snapshot.completionId)
+          || (initialAttemptAt > 0 && claimNow - initialAttemptAt < LOCK_INITIAL_IN_FLIGHT_GRACE_MS)) return null;
+      }
+      if (entry.status === 'creating-replay'
+        && Number(entry.lastAttemptAt) > 0
+        && claimNow - Number(entry.lastAttemptAt) < 10_000) return null;
       entry.status = 'creating-replay';
       entry.attempts = Math.max(0, Number(entry.attempts) || 0) + 1;
-      entry.lastAttemptAt = Date.now();
+      entry.lastAttemptAt = claimNow;
       entry.tabClosed = tabClosed;
       return { ...entry };
     });
@@ -751,6 +792,11 @@ async function performPendingLockedReplayFlush() {
     payload.completionId = marked.completionId;
     payload.notificationKind = 'unlock-replay';
     const routes = await routeNotification(payload, settings);
+    const afterCreate = await getLockedReplay(marked.completionId);
+    if (afterCreate?.status === 'acknowledged') {
+      await clearReplayPair(afterCreate);
+      continue;
+    }
     if (routes.browser || routes.web) {
       await updateLockedReplay(marked.completionId, (entry) => {
         if (entry.status === 'acknowledged') return entry;
@@ -823,11 +869,14 @@ function findNotificationState(store, tabId, pathHash, completionId) {
 
 function preservePendingNotification(store, state) {
   const normalized = finalizationAPI.normalizeState(state);
-  if (!normalized?.notified || normalized.notificationStatus !== 'pending') return false;
+  const unfinishedTurn = normalized && !normalized.notified && normalized.notificationStatus === 'none';
+  const pendingNotification = normalized?.notified && normalized.notificationStatus === 'pending';
+  if (!unfinishedTurn && !pendingNotification) return false;
   if (!Number.isInteger(normalized.tabId) || !normalized.completionId) return false;
   const key = notificationOutboxKey(normalized.tabId, normalized.completionId);
   const existing = finalizationAPI.normalizeState(store[key]);
-  if (existing?.completionId === normalized.completionId && existing.notificationStatus === 'pending') {
+  if (existing?.completionId === normalized.completionId
+    && (existing.notificationStatus === 'pending' || !existing.notified)) {
     return true;
   }
   store[key] = normalized;
@@ -901,8 +950,9 @@ async function activeFinalizationEntries() {
   const store = { ...(await loadFinalizationStore()) };
   pruneFinalizationStore(store);
   const now = Date.now();
-  return Object.entries(store).filter(([, state]) => (
-    state
+  return Object.entries(store).filter(([key, state]) => (
+    !key.startsWith(NOTIFICATION_OUTBOX_KEY_PREFIX)
+    && state
     && !state.notified
     && !state.suspended
     && (!Number(state.expiresAt) || Number(state.expiresAt) > now)
@@ -1596,6 +1646,31 @@ async function handleRouteMove(message, sender) {
     const toKey = finalizationKey(tabId, toPathHash);
     const prior = finalizationAPI.normalizeState(store[fromKey]);
     const destination = finalizationAPI.normalizeState(store[toKey]);
+    const incomingDocumentId = String(sender?.documentId || '');
+    const eventAt = Number(message.at) || Date.now();
+    const incomingRouteEpoch = Math.max(0, Math.trunc(Number(message.routeEpoch) || 0));
+    const staleClaimReason = (state) => {
+      if (!state) return '';
+      const existingDocumentId = String(state.documentId || '');
+      const previousClaimAt = Number(state.documentClaimAt) || Number(state.lastActivityAt) || 0;
+      const differentDocument = Boolean(existingDocumentId && incomingDocumentId
+        && existingDocumentId !== incomingDocumentId);
+      if (differentDocument && eventAt <= previousClaimAt) return 'stale-document-claim';
+      if (!differentDocument && incomingRouteEpoch < state.routeEpoch) return 'stale-route-epoch';
+      return '';
+    };
+    if (prior?.completionId === completionId) {
+      const staleReason = staleClaimReason(prior);
+      if (staleReason) {
+        return { ok: false, reason: staleReason, pending: pendingRouteSummary(prior) };
+      }
+    }
+    if (destination?.completionId === completionId) {
+      const staleReason = staleClaimReason(destination);
+      if (staleReason) {
+        return { ok: false, reason: staleReason, pending: pendingRouteSummary(destination) };
+      }
+    }
     if (destination && destination.completionId !== completionId) {
       return { ok: false, reason: 'destination-owned', pending: pendingRouteSummary(destination) };
     }
@@ -1677,16 +1752,25 @@ async function handleDomCandidate(message, sender) {
   const event = message?.payload?.event || {};
   const context = message?.payload?.context || {};
   const hasFinalAction = event.hasFinalAction === true || context.hasFinalAction === true;
-  const result = await mutateFinalization(tabId, pathHash, (state, store, currentKey) => {
+  const result = await queueFinalizationMutation((store) => {
+    const currentKey = finalizationKey(tabId, pathHash);
+    const outboxKey = notificationOutboxKey(tabId, completionId);
+    const routeState = finalizationAPI.normalizeState(store[currentKey]);
+    const outboxState = finalizationAPI.normalizeState(store[outboxKey]);
+    const stateKey = routeState?.completionId === completionId
+      ? currentKey
+      : (outboxState?.completionId === completionId ? outboxKey : currentKey);
+    const state = finalizationAPI.normalizeState(store[stateKey]);
     const completionIsRoutedElsewhere = Object.entries(store).some(([key, rawState]) => (
-      key !== currentKey
-      && (key.startsWith(`${tabId}:`) || key === notificationOutboxKey(tabId, completionId))
+      key !== stateKey
+      && key !== outboxKey
+      && key.startsWith(`${tabId}:`)
       && finalizationAPI.normalizeState(rawState)?.completionId === completionId
     ));
     if (completionIsRoutedElsewhere) {
-      return { state, action: { type: 'suppress', reason: 'completion-route-mismatch' } };
+      return { state, stateKey, action: { type: 'suppress', reason: 'completion-route-mismatch' } };
     }
-    return finalizationAPI.acceptDomCandidate(state, {
+    const accepted = finalizationAPI.acceptDomCandidate(state, {
       tabId,
       documentId: String(sender?.documentId || ''),
       pathHash,
@@ -1700,6 +1784,9 @@ async function handleDomCandidate(message, sender) {
       hasFinalAction,
       finalEvidence: String(event.finalEvidence || (hasFinalAction ? 'final-action' : '')),
     });
+    if (accepted.state) store[stateKey] = accepted.state;
+    else delete store[stateKey];
+    return { ...accepted, stateKey };
   });
 
   void recordLifecycleDiagnostic({

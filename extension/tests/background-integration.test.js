@@ -21,6 +21,13 @@ function createEvent() {
 }
 
 function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
+  const cloneStorageValue = (value) => (
+    Array.isArray(value)
+      ? value.map(cloneStorageValue)
+      : (value && typeof value === 'object'
+        ? Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, cloneStorageValue(nested)]))
+        : value)
+  );
   let clock = Number(environmentOverrides.now) || 10_000;
   let nextTimerId = 1;
   const timers = new Map();
@@ -57,6 +64,9 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
   let failedSessionWrites = Math.max(0, Number(environmentOverrides.failedSessionWrites) || 0);
   let failedSessionReads = Math.max(0, Number(environmentOverrides.failedSessionReads) || 0);
   let failedLocalReads = Math.max(0, Number(environmentOverrides.failedLocalReads) || 0);
+  let failedLocalWrites = Math.max(0, Number(environmentOverrides.failedLocalWrites) || 0);
+  const deferredNotificationQueries = [];
+  let deferNotificationQuery = environmentOverrides.deferNotificationQuery === true;
   let closeDuringNextGetAll = '';
   let deferNotificationCreate = environmentOverrides.deferNotificationCreate === true;
   const tabActive = environmentOverrides.tabActive ?? false;
@@ -127,11 +137,23 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
           }
           const result = {};
           for (const [key, fallback] of Object.entries(defaults || {})) {
-            result[key] = Object.hasOwn(localStore, key) ? localStore[key] : fallback;
+            result[key] = Object.hasOwn(localStore, key)
+              ? cloneStorageValue(localStore[key])
+              : cloneStorageValue(fallback);
           }
           callback(result);
         },
-        set(items, callback) { Object.assign(localStore, items); callback?.(); },
+        set(items, callback) {
+          if (failedLocalWrites > 0) {
+            failedLocalWrites -= 1;
+            runtime.lastError = { message: 'test-local-write-failed' };
+            callback?.();
+            runtime.lastError = null;
+            return;
+          }
+          Object.assign(localStore, cloneStorageValue(items));
+          callback?.();
+        },
       },
     },
     offscreen: {
@@ -161,20 +183,24 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
       },
       getAll(callback) {
         const snapshot = { ...activeNotifications };
-        if (failedNotificationQueries > 0) {
-          failedNotificationQueries -= 1;
-          runtime.lastError = { message: 'test-notification-query-failed' };
-          callback({});
-          runtime.lastError = null;
-        } else {
-          callback(snapshot);
-        }
-        if (closeDuringNextGetAll) {
-          const id = closeDuringNextGetAll;
-          closeDuringNextGetAll = '';
-          delete activeNotifications[id];
-          events.onClosed.dispatch(id, false);
-        }
+        const finish = () => {
+          if (failedNotificationQueries > 0) {
+            failedNotificationQueries -= 1;
+            runtime.lastError = { message: 'test-notification-query-failed' };
+            callback({});
+            runtime.lastError = null;
+          } else {
+            callback(snapshot);
+          }
+          if (closeDuringNextGetAll) {
+            const id = closeDuringNextGetAll;
+            closeDuringNextGetAll = '';
+            delete activeNotifications[id];
+            events.onClosed.dispatch(id, false);
+          }
+        };
+        if (deferNotificationQuery) deferredNotificationQueries.push(finish);
+        else finish();
       },
       clear(id, callback) { const existed = Boolean(activeNotifications[id]); delete activeNotifications[id]; callback?.(existed); },
       onClicked: events.onClicked,
@@ -285,7 +311,17 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
     setFailedSessionWrites(value) { failedSessionWrites = Math.max(0, Number(value) || 0); },
     setFailedSessionReads(value) { failedSessionReads = Math.max(0, Number(value) || 0); },
     setFailedLocalReads(value) { failedLocalReads = Math.max(0, Number(value) || 0); },
+    setFailedLocalWrites(value) { failedLocalWrites = Math.max(0, Number(value) || 0); },
+    setDeferNotificationQuery(value) { deferNotificationQuery = value === true; },
     setDeferNotificationCreate(value) { deferNotificationCreate = value === true; },
+    get deferredNotificationQueryCount() { return deferredNotificationQueries.length; },
+    async completeNextNotificationQuery() {
+      const complete = deferredNotificationQueries.shift();
+      if (!complete) return false;
+      complete();
+      await flushTurns(12);
+      return true;
+    },
     closeOnNextGetAll(id) { closeDuringNextGetAll = String(id || ''); },
     async setIdleState(value) {
       idleState = value;
@@ -515,6 +551,27 @@ test('a pending completion survives a new turn on the same route', async () => {
     .some((state) => state.completionId === 'same-route-first' && state.notificationStatus === 'pending'), false);
 });
 
+test('an unfinished turn remains finalizable after a newer turn claims the same route', async () => {
+  const h = createHarness({ sound: false });
+  await h.sendRuntimeMessage(turnStart('unfinished-before-new-turn'));
+  await h.sendRuntimeMessage(turnStart('newer-same-route-turn', {
+    at: 11_000, startedAt: 11_000, userCount: 2, assistantCount: 1,
+  }));
+
+  const outboxEntry = Object.entries(h.sessionStore.turnbellFinalizationV2)
+    .find(([key, state]) => key.startsWith('notification-outbox:')
+      && state.completionId === 'unfinished-before-new-turn');
+  assert.ok(outboxEntry);
+  assert.equal(outboxEntry[1].notified, false);
+
+  const candidate = await h.sendRuntimeMessage(domCandidate('unfinished-before-new-turn'));
+  assert.equal(candidate.notificationStatus, 'delivered');
+  assert.deepEqual(h.activeNotificationIds(), ['turnbell-42-completion-unfinished-before-new-turn']);
+  assert.equal(h.sessionStore.turnbellFinalizationV2[`42:${PATH_A}`].completionId, 'newer-same-route-turn');
+  assert.equal(Object.keys(h.sessionStore.turnbellFinalizationV2)
+    .some((key) => key.startsWith('notification-outbox:')) , false);
+});
+
 test('a pending completion is retained when its originating tab closes', async () => {
   const h = createHarness({ sound: false }, { failedNotificationCreates: 1 });
   await h.sendRuntimeMessage(turnStart('closed-tab-pending'));
@@ -560,6 +617,29 @@ test('route movement cannot overwrite an existing conversation completion', asyn
   const staleCandidate = await h.sendRuntimeMessage(domCandidate('placeholder-a', { pathHash: PATH_B }));
   assert.equal(staleCandidate.suppressed, true);
   assert.equal(h.notifications.length, 1);
+});
+
+test('a delayed route move from an older document cannot steal a pending completion', async () => {
+  const h = createHarness({ sound: false });
+  h.setClock(20_000);
+  const oldDocument = { tab: { id: 42 }, documentId: 'route-move-old', documentLifecycle: 'active' };
+  const currentDocument = { tab: { id: 42 }, documentId: 'route-move-current', documentLifecycle: 'active' };
+  await h.sendRuntimeMessage(turnStart('late-route-move', { at: 20_000 }), oldDocument);
+  const claimed = await h.sendRuntimeMessage({
+    type: 'route-enter', pathHash: PATH_A, routeEpoch: 2, at: 21_000,
+  }, currentDocument);
+  assert.equal(claimed.pending?.completionId, 'late-route-move');
+
+  const moved = await h.sendRuntimeMessage({
+    ...turnMove('late-route-move', PATH_A, PATH_B),
+    routeEpoch: 1,
+    at: 20_500,
+  }, oldDocument);
+
+  assert.equal(moved.ok, false);
+  assert.equal(moved.reason, 'stale-document-claim');
+  assert.equal(h.sessionStore.turnbellFinalizationV2[`42:${PATH_A}`].documentId, 'route-move-current');
+  assert.equal(h.sessionStore.turnbellFinalizationV2[`42:${PATH_B}`], undefined);
 });
 
 test('a failed session write does not leak an unpersisted completion into the worker cache', async () => {
@@ -1053,6 +1133,47 @@ test('unlock racing with a retry of a pending initial alert cannot create a seco
   assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'initial-active');
 });
 
+test('unlock replay uses the current queue claim when its notification snapshot is stale', async () => {
+  const localStore = {
+    turnbellLockedReplayQueueV1: [{
+      completionId: 'stale-unlock-snapshot',
+      tabId: 42,
+      completedAt: 10_000,
+      durationMs: 1_000,
+      initialNotificationId: 'turnbell-42-lock-stale-unlock-snapshot-initial',
+      replayNotificationId: 'turnbell-42-lock-stale-unlock-snapshot-unlock',
+      initialWebTag: 'turnbell-web-stale-unlock-snapshot-initial',
+      replayWebTag: 'turnbell-web-stale-unlock-snapshot-unlock',
+      notificationBackend: 'extension',
+      status: 'pending',
+      initialAttemptAt: 1,
+      attempts: 0,
+      expiresAt: 90_000_000,
+      tabClosed: false,
+      initialClosed: false,
+    }],
+  };
+  const h = createHarness({ sound: false }, {
+    localStore,
+    now: 80_000,
+    deferNotificationQuery: true,
+  });
+
+  await h.setIdleState('active');
+  assert.equal(h.deferredNotificationQueryCount, 1);
+  // Model a concurrent initial-notification retry claiming the queue after the
+  // unlock flusher copied its pending snapshot but before it claims a replay.
+  localStore.turnbellLockedReplayQueueV1[0] = {
+    ...localStore.turnbellLockedReplayQueueV1[0],
+    status: 'creating-initial',
+    initialAttemptAt: 80_000,
+  };
+  assert.equal(await h.completeNextNotificationQuery(), true);
+
+  assert.equal(h.notifications.length, 0);
+  assert.equal(localStore.turnbellLockedReplayQueueV1[0].status, 'creating-initial');
+});
+
 test('a Web initial alert removed by the system is replayed after unlock without a close event', async () => {
   const h = createHarness({ sound: false, notificationBackend: 'web' }, { idleState: 'locked' });
   await h.sendRuntimeMessage(turnStart('web-initial-system-close'));
@@ -1078,8 +1199,66 @@ test('a user-dismissed locked notification acknowledges the replay record', asyn
   h.events.onClosed.dispatch(h.notifications[0].id, true);
   await h.flush();
   assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'acknowledged');
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].cleanupComplete, true);
   await h.setIdleState('active');
   assert.equal(h.notifications.length, 1);
+});
+
+for (const failedStoreOperation of ['read', 'write']) {
+  test(`a transient lock replay ${failedStoreOperation} failure preserves a user dismissal`, async () => {
+    const h = createHarness({ sound: false }, { idleState: 'locked' });
+    await h.sendRuntimeMessage(turnStart(`dismiss-retry-${failedStoreOperation}`));
+    await h.sendRuntimeMessage(domCandidate(`dismiss-retry-${failedStoreOperation}`));
+    const initialId = h.notifications[0].id;
+
+    if (failedStoreOperation === 'read') h.setFailedLocalReads(1);
+    else h.setFailedLocalWrites(1);
+    await h.closeNotification(initialId, true);
+    await h.setIdleState('active');
+
+    assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'acknowledged');
+    assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].cleanupComplete, true);
+    assert.equal(h.notifications.length, 1);
+    assert.equal(h.activeNotificationIds().length, 0);
+  });
+}
+
+test('a failed dismissal acknowledgement retries cleanup for an already replayed alert', async () => {
+  const h = createHarness({ sound: false }, { idleState: 'locked' });
+  await h.sendRuntimeMessage(turnStart('dismiss-replayed-alert'));
+  await h.sendRuntimeMessage(domCandidate('dismiss-replayed-alert'));
+  const initialId = h.notifications[0].id;
+  await h.closeNotification(initialId, false);
+  await h.setIdleState('active');
+  const replayId = 'turnbell-42-lock-dismiss-replayed-alert-unlock';
+  assert.equal(h.notifications[1].id, replayId);
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'replayed');
+
+  h.setFailedLocalReads(1);
+  await h.closeNotification(replayId, true);
+  await h.setIdleState('active');
+
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'acknowledged');
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].cleanupComplete, true);
+  assert.equal(h.notifications.length, 2);
+  assert.equal(h.activeNotificationIds().length, 0);
+});
+
+test('an acknowledged lock record resumes cleanup after a finalization-store failure', async () => {
+  const h = createHarness({ sound: false }, { idleState: 'locked' });
+  await h.sendRuntimeMessage(turnStart('ack-cleanup-retry'));
+  await h.sendRuntimeMessage(domCandidate('ack-cleanup-retry'));
+  const initialId = h.notifications[0].id;
+  h.setFailedSessionWrites(1);
+
+  await h.closeNotification(initialId, true);
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'acknowledged');
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].cleanupComplete, false);
+
+  await h.setIdleState('active');
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].cleanupComplete, true);
+  assert.equal(h.notifications.length, 1);
+  assert.equal(h.activeNotificationIds().length, 0);
 });
 
 test('Web Notification click waits for locked-replay acknowledgement', async () => {

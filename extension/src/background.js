@@ -13,10 +13,17 @@ const tabMonitor = globalThis.GPTReplyTabMonitor.createMonitor(chrome);
 const NOTIFICATION_PREFIX = 'turnbell-';
 const FINALIZATION_STORAGE_KEY = 'turnbellFinalizationV2';
 const LAST_DIAGNOSTIC_KEY = 'turnbellLastNotificationDiagnostic';
+const LOCK_REPLAY_STORAGE_KEY = 'turnbellLockedReplayQueueV1';
+const LOCK_REPLAY_TTL_MS = 24 * 60 * 60 * 1_000;
+const LOCK_REPLAY_QUEUE_LIMIT = 20;
 const settleChecks = new Map();
+const lockInitialNotificationsInFlight = new Set();
+const lockReplayAttemptsInFlight = new Set();
 let offscreenCreation = null;
 let finalizationStorePromise = null;
 let finalizationMutation = Promise.resolve();
+let lockReplayMutation = Promise.resolve();
+let lockReplayFlush = Promise.resolve();
 
 function storageGet(defaults) {
   return new Promise((resolve) => {
@@ -45,6 +52,152 @@ function sessionSet(items) {
   if (!chrome.storage.session) return Promise.resolve(false);
   return new Promise((resolve) => {
     chrome.storage.session.set(items, () => resolve(!chrome.runtime.lastError));
+  });
+}
+
+function pruneLockReplayQueue(queue, now = Date.now()) {
+  for (let index = queue.length - 1; index >= 0; index -= 1) {
+    const item = queue[index];
+    if (!item || Number(item.expiresAt) <= now) queue.splice(index, 1);
+  }
+  queue.sort((left, right) => Number(left.completedAt) - Number(right.completedAt));
+  while (queue.length > LOCK_REPLAY_QUEUE_LIMIT) queue.shift();
+}
+
+function mutateLockReplayQueue(updater) {
+  const run = lockReplayMutation.then(async () => {
+    const items = await sessionGet({ [LOCK_REPLAY_STORAGE_KEY]: [] });
+    const queue = Array.isArray(items?.[LOCK_REPLAY_STORAGE_KEY])
+      ? items[LOCK_REPLAY_STORAGE_KEY]
+      : [];
+    pruneLockReplayQueue(queue);
+    const result = await updater(queue);
+    pruneLockReplayQueue(queue);
+    if (!await sessionSet({ [LOCK_REPLAY_STORAGE_KEY]: queue })) {
+      throw new Error('locked-replay-store-write-failed');
+    }
+    return result;
+  });
+  lockReplayMutation = run.catch(() => undefined);
+  return run;
+}
+
+function queryIdleState() {
+  if (typeof chrome.idle?.queryState !== 'function') return Promise.resolve('unknown');
+  return new Promise((resolve) => {
+    let finished = false;
+    const done = (state) => {
+      if (finished) return;
+      finished = true;
+      resolve(['active', 'idle', 'locked'].includes(String(state)) ? String(state) : 'unknown');
+    };
+    try {
+      const possiblePromise = chrome.idle.queryState(15, done);
+      if (possiblePromise && typeof possiblePromise.then === 'function') {
+        possiblePromise.then(done, () => done('unknown'));
+      }
+    } catch {
+      done('unknown');
+    }
+  });
+}
+
+function createLockReplayEntry(tabId, completedAt, durationMs) {
+  const tabPart = Number.isInteger(tabId) ? tabId : 'unknown';
+  const token = `${Math.max(0, Math.trunc(Number(completedAt) || Date.now())).toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const id = `${tabPart}-${token}`;
+  const now = Date.now();
+  return {
+    id,
+    tabId: Number.isInteger(tabId) ? tabId : null,
+    completedAt: Math.max(0, Number(completedAt) || now),
+    durationMs: Math.max(0, Number(durationMs) || 0),
+    notificationId: `${NOTIFICATION_PREFIX}${tabPart}-unlock-${token}`,
+    webTag: `turnbell-lock-${tabPart}-${token}`,
+    status: 'initializing',
+    createdAt: now,
+    lastAttemptAt: 0,
+    attempts: 0,
+    expiresAt: now + LOCK_REPLAY_TTL_MS,
+  };
+}
+
+async function enqueueLockReplay(item) {
+  return mutateLockReplayQueue((queue) => {
+    if (!queue.some((entry) => entry.id === item.id)) queue.push({ ...item });
+    return true;
+  });
+}
+
+async function markLockReplayReady(id) {
+  return mutateLockReplayQueue((queue) => {
+    const item = queue.find((entry) => entry.id === id);
+    if (item?.status === 'initializing') item.status = 'pending';
+    return Boolean(item);
+  });
+}
+
+async function pendingLockReplays() {
+  return mutateLockReplayQueue((queue) => {
+    for (const item of queue) {
+      if (item.status === 'initializing' && !lockInitialNotificationsInFlight.has(item.id)) {
+        item.status = 'pending';
+      } else if (item.status === 'replaying' && !lockReplayAttemptsInFlight.has(item.id)) {
+        item.status = 'pending';
+      }
+    }
+    return queue.filter((item) => item.status === 'pending').map((item) => ({ ...item }));
+  });
+}
+
+async function claimLockReplay(id) {
+  return mutateLockReplayQueue((queue) => {
+    const item = queue.find((entry) => entry.id === id);
+    if (!item || item.status !== 'pending') return null;
+    item.status = 'replaying';
+    item.lastAttemptAt = Date.now();
+    item.attempts = Math.max(0, Number(item.attempts) || 0) + 1;
+    return { ...item };
+  });
+}
+
+async function finishLockReplay(id, delivered) {
+  return mutateLockReplayQueue((queue) => {
+    const index = queue.findIndex((item) => item.id === id);
+    if (index < 0) return false;
+    if (delivered) queue.splice(index, 1);
+    else {
+      queue[index].status = 'pending';
+      queue[index].lastAttemptAt = 0;
+    }
+    return true;
+  });
+}
+
+async function discardLockReplays() {
+  return mutateLockReplayQueue((queue) => {
+    queue.length = 0;
+    return true;
+  });
+}
+
+async function acknowledgeLockReplay(id) {
+  if (!id) return false;
+  return mutateLockReplayQueue((queue) => {
+    const index = queue.findIndex((item) => item.id === id);
+    if (index < 0) return false;
+    queue.splice(index, 1);
+    return true;
+  });
+}
+
+async function acknowledgeLockReplayByNotificationId(notificationId) {
+  if (!notificationId) return false;
+  return mutateLockReplayQueue((queue) => {
+    const index = queue.findIndex((item) => item.notificationId === notificationId);
+    if (index < 0) return false;
+    queue.splice(index, 1);
+    return true;
   });
 }
 
@@ -123,6 +276,29 @@ function durationLabel(durationMs) {
   return `用时 ${minutes} 分 ${seconds} 秒`;
 }
 
+async function clearNotification(notificationId) {
+  if (!notificationId || typeof chrome.notifications?.clear !== 'function') return false;
+  return new Promise((resolve) => {
+    try {
+      chrome.notifications.clear(notificationId, (cleared) => resolve(Boolean(cleared)));
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+async function closeWebNotification(tag) {
+  if (!tag || typeof globalThis.registration?.getNotifications !== 'function') return false;
+  try {
+    const notifications = await globalThis.registration.getNotifications({ tag });
+    if (!Array.isArray(notifications)) return false;
+    for (const notification of notifications) notification.close?.();
+    return notifications.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 async function showBrowserNotification(payload, settings) {
   const permission = await getNotificationPermissionLevel();
   if (permission !== 'granted') {
@@ -137,7 +313,7 @@ async function showBrowserNotification(payload, settings) {
   }
 
   const tabPart = Number.isInteger(payload.tabId) ? payload.tabId : 'unknown';
-  const notificationId = `${NOTIFICATION_PREFIX}${tabPart}-${Date.now()}`;
+  const notificationId = String(payload.notificationId || `${NOTIFICATION_PREFIX}${tabPart}-${Date.now()}`);
   const result = await new Promise((resolve) => {
     chrome.notifications.create(notificationId, {
       type: 'basic',
@@ -190,7 +366,8 @@ async function showServiceWorkerNotification(payload, settings) {
       diagnostic: 'web-unsupported', error: 'ServiceWorkerRegistration.showNotification is unavailable.',
     };
   }
-  const tag = `turnbell-web-${Number.isInteger(payload.tabId) ? payload.tabId : 'unknown'}-${Date.now()}`;
+  const tag = String(payload.webTag
+    || `turnbell-web-${Number.isInteger(payload.tabId) ? payload.tabId : 'unknown'}-${Date.now()}`);
   try {
     await registrationObject.showNotification(payload.title, {
       body: payload.message,
@@ -199,7 +376,7 @@ async function showServiceWorkerNotification(payload, settings) {
       tag,
       requireInteraction: settings.persistentNotification,
       silent: notificationAPI.notificationSilent(settings),
-      data: { tabId: payload.tabId, url: payload.url },
+      data: { tabId: payload.tabId, url: payload.url, lockReplayId: String(payload.lockReplayId || '') },
     });
     let active = true;
     if (typeof registrationObject.getNotifications === 'function') {
@@ -282,6 +459,63 @@ async function routeNotification(payload, settings) {
   return routes;
 }
 
+async function performLockedReplayFlush() {
+  if (await queryIdleState() === 'locked') return { replayed: 0, locked: true };
+  const settings = await getSettings();
+  if (!settings.enabled) {
+    await discardLockReplays();
+    return { replayed: 0, disabled: true };
+  }
+
+  const items = await pendingLockReplays();
+  let replayed = 0;
+  for (const snapshot of items) {
+    if (await queryIdleState() === 'locked') return { replayed, locked: true };
+    const item = await claimLockReplay(snapshot.id);
+    if (!item) continue;
+    lockReplayAttemptsInFlight.add(item.id);
+
+    let delivered = false;
+    try {
+      await Promise.all([
+        clearNotification(item.notificationId),
+        closeWebNotification(item.webTag),
+      ]);
+      if (await queryIdleState() === 'locked') continue;
+
+      const payload = notificationAPI.makeNotificationPayload({
+        durationMs: item.durationMs,
+        fingerprint: '',
+      }, {
+        tabId: item.tabId,
+        pageTitle: 'ChatGPT',
+        url: 'https://chatgpt.com/',
+        tabHidden: true,
+      });
+      payload.message = '锁屏期间有一轮回复完成';
+      payload.notificationId = item.notificationId;
+      payload.webTag = item.webTag;
+      payload.lockReplayId = item.id;
+      const routes = await routeNotification(payload, settings);
+      delivered = routes.browser || routes.web;
+    } catch (error) {
+      console.warn('[TurnBell] locked notification replay failed', error);
+    } finally {
+      lockReplayAttemptsInFlight.delete(item.id);
+      try { await finishLockReplay(item.id, delivered); }
+      catch (error) { console.warn('[TurnBell] locked replay state update failed', error); }
+    }
+    if (delivered) replayed += 1;
+  }
+  return { replayed, locked: false };
+}
+
+function flushLockedReplays() {
+  const run = lockReplayFlush.then(() => performLockedReplayFlush());
+  lockReplayFlush = run.catch(() => undefined);
+  return run;
+}
+
 function getTab(tabId) {
   return new Promise((resolve) => {
     if (!Number.isInteger(tabId)) { resolve(null); return; }
@@ -361,8 +595,38 @@ async function notifyFromFinal(tabId, action, event = {}, rawContext = {}, force
     durationMs: Math.max(0, completedAt - startedAt),
     fingerprint: String(event.fingerprint || ''),
   }, context);
-  const routes = await routeNotification(payload, settings);
-  return { ok: true, payload, routes };
+
+  let lockReplay = null;
+  if (await queryIdleState() === 'locked') {
+    lockReplay = createLockReplayEntry(tabId, completedAt, payload.durationMs);
+    lockInitialNotificationsInFlight.add(lockReplay.id);
+    try {
+      await enqueueLockReplay(lockReplay);
+      payload.notificationId = lockReplay.notificationId;
+      payload.webTag = lockReplay.webTag;
+      payload.lockReplayId = lockReplay.id;
+    } catch (error) {
+      lockInitialNotificationsInFlight.delete(lockReplay.id);
+      lockReplay = null;
+      console.warn('[TurnBell] could not queue locked notification replay', error);
+    }
+  }
+
+  try {
+    const routes = await routeNotification(payload, settings);
+    return { ok: true, payload, routes };
+  } finally {
+    if (lockReplay) {
+      try { await markLockReplayReady(lockReplay.id); }
+      catch (error) { console.warn('[TurnBell] could not ready locked notification replay', error); }
+      lockInitialNotificationsInFlight.delete(lockReplay.id);
+      try {
+        if (await queryIdleState() !== 'locked') await flushLockedReplays();
+      } catch (error) {
+        console.warn('[TurnBell] could not replay unlocked notification', error);
+      }
+    }
+  }
 }
 
 async function handleTurnStart(message, sender) {
@@ -488,11 +752,27 @@ async function removeTabState(tabId) {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  void (async () => { await ensureDefaultSettings(); await injectExistingChatGPTTabs(); })();
+  void (async () => {
+    await ensureDefaultSettings();
+    await injectExistingChatGPTTabs();
+    await flushLockedReplays();
+  })();
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  void (async () => { await ensureDefaultSettings(); await injectExistingChatGPTTabs(); })();
+  void (async () => {
+    await ensureDefaultSettings();
+    await injectExistingChatGPTTabs();
+    await flushLockedReplays();
+  })();
+});
+
+try { chrome.idle?.setDetectionInterval?.(15); } catch { /* optional in older Chromium builds */ }
+chrome.idle?.onStateChanged?.addListener((state) => {
+  if (String(state) === 'locked') return;
+  void flushLockedReplays().catch((error) => {
+    console.warn('[TurnBell] unlocked notification replay failed', error);
+  });
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -557,7 +837,8 @@ if (typeof globalThis.addEventListener === 'function') {
   globalThis.addEventListener('notificationclick', (event) => {
     const data = event?.notification?.data || {};
     event?.notification?.close?.();
-    const work = Promise.resolve().then(() => {
+    const work = Promise.resolve().then(async () => {
+      if (data.lockReplayId) await acknowledgeLockReplay(String(data.lockReplayId));
       const tabId = Number(data.tabId);
       if (Number.isInteger(tabId)) void clearCompletionBadge(tabId);
       openChatGPT(Number.isInteger(tabId) ? tabId : null);
@@ -569,9 +850,18 @@ if (typeof globalThis.addEventListener === 'function') {
 chrome.notifications.onClicked.addListener((notificationId) => {
   const match = new RegExp(`^${NOTIFICATION_PREFIX}(\\d+)-`).exec(notificationId);
   const tabId = match ? Number(match[1]) : null;
-  if (Number.isInteger(tabId)) void clearCompletionBadge(tabId);
-  openChatGPT(tabId);
-  chrome.notifications.clear(notificationId);
+  void (async () => {
+    await acknowledgeLockReplayByNotificationId(notificationId);
+    if (Number.isInteger(tabId)) void clearCompletionBadge(tabId);
+    openChatGPT(tabId);
+    await clearNotification(notificationId);
+  })();
+});
+
+chrome.notifications.onClosed?.addListener((notificationId, byUser) => {
+  if (byUser === true) {
+    void acknowledgeLockReplayByNotificationId(notificationId);
+  }
 });
 
 chrome.tabs.onActivated.addListener((activeInfo) => {

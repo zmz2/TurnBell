@@ -454,7 +454,7 @@
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     switch (message?.type) {
       case 'monitor-ping':
-        sendResponse({ ok: true, active: true, version: '1.5.0', mode: 'dom-only' });
+        sendResponse({ ok: true, active: true, version: '1.5.1', mode: 'dom-only' });
         return false;
       case 'monitor-sample-now': {
         const state = detector.getState();

@@ -9,7 +9,7 @@ import json
 from pathlib import Path, PurePosixPath
 import zipfile
 
-REQUIRED_PERMISSIONS = {"notifications", "storage", "offscreen", "scripting"}
+REQUIRED_PERMISSIONS = {"notifications", "storage", "offscreen", "scripting", "idle"}
 REQUIRED_HOSTS = {"https://chatgpt.com/*", "https://chat.openai.com/*"}
 FORBIDDEN_RUNTIME_FILES = {
     "src/main-world-stream.js",

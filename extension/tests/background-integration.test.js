@@ -48,12 +48,14 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
   const sessionStore = {};
   const tabActive = environmentOverrides.tabActive ?? false;
   const windowFocused = environmentOverrides.windowFocused ?? true;
+  let idleState = environmentOverrides.idleState ?? 'active';
+  let notificationCreateHook = null;
 
   const events = {
     onInstalled: createEvent(), onStartup: createEvent(), onMessage: createEvent(),
     onClicked: createEvent(), onClosed: createEvent(), onRemoved: createEvent(),
     onActivated: createEvent(), onBeforeRequest: createEvent(), onCompleted: createEvent(),
-    onErrorOccurred: createEvent(), onAlarm: createEvent(),
+    onErrorOccurred: createEvent(), onAlarm: createEvent(), onIdleStateChanged: createEvent(),
   };
 
   const runtime = {
@@ -94,6 +96,11 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
       create(id, options, callback) {
         notifications.push({ id, options });
         activeNotifications[id] = options;
+        if (notificationCreateHook) {
+          const hook = notificationCreateHook;
+          notificationCreateHook = null;
+          hook({ id, options });
+        }
         callback(id);
       },
       getAll(callback) { callback({ ...activeNotifications }); },
@@ -105,6 +112,11 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
       setBadgeText(details) { badgeCalls.push({ type: 'text', ...details }); return Promise.resolve(); },
       setBadgeBackgroundColor(details) { badgeCalls.push({ type: 'color', ...details }); return Promise.resolve(); },
       setTitle(details) { badgeCalls.push({ type: 'title', ...details }); return Promise.resolve(); },
+    },
+    idle: {
+      setDetectionInterval() {},
+      queryState(_thresholdSeconds, callback) { callback(idleState); },
+      onStateChanged: events.onIdleStateChanged,
     },
     tabs: {
       query(_query, callback) { callback([]); },
@@ -134,7 +146,19 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
   const context = {
     chrome, console, URL, Map, Set, Promise, Object, Number, String, Boolean, RegExp, Math, Date: FakeDate,
     registration: {
-      async showNotification(title, options) { webNotifications.push({ title, options }); },
+      async showNotification(title, options) {
+        const existingIndex = webNotifications.findIndex((item) => item.options.tag === options.tag);
+        const notification = {
+          title,
+          options,
+          close() {
+            const index = webNotifications.indexOf(notification);
+            if (index >= 0) webNotifications.splice(index, 1);
+          },
+        };
+        if (existingIndex >= 0) webNotifications.splice(existingIndex, 1, notification);
+        else webNotifications.push(notification);
+      },
       async getNotifications({ tag } = {}) { return webNotifications.filter((item) => !tag || item.options.tag === tag); },
     },
     addEventListener() {},
@@ -158,6 +182,11 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
 
   return {
     badgeCalls, createdTabs, events, notifications, sessionStore, soundMessages, tabMessages, webNotifications,
+    setIdleState(state, dispatch = true) {
+      idleState = String(state);
+      if (dispatch) events.onIdleStateChanged.dispatch(idleState);
+    },
+    setNotificationCreateHook(hook) { notificationCreateHook = hook; },
     setClock(value) { clock = value; },
     async flush() { await flushTurns(); },
     async runNextTimer() {
@@ -335,4 +364,61 @@ test('Web Notification compatibility backend bypasses chrome.notifications routi
   assert.equal(response.routes.webPermission, 'granted');
   assert.equal(h.webNotifications.length, 1);
   assert.equal(h.webNotifications[0].options.requireInteraction, true);
+});
+
+test('a completion delivered while locked is recreated once after unlock without saving conversation content', async () => {
+  const h = createHarness({ sound: false }, { idleState: 'locked' });
+  await h.sendRuntimeMessage({ type: 'turn-start', turnKey: 'turn-locked', userCount: 1, at: 10_000 });
+  const response = await h.sendRuntimeMessage(domCandidate('turn-locked'));
+  const queued = h.sessionStore.turnbellLockedReplayQueueV1;
+
+  assert.equal(response.ok, true);
+  assert.equal(h.notifications.length, 1);
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].status, 'pending');
+  assert.equal(queued[0].tabId, 42);
+  assert.equal(queued[0].notificationId, h.notifications[0].id);
+  assert.equal(Object.hasOwn(queued[0], 'pageTitle'), false);
+  assert.equal(Object.hasOwn(queued[0], 'url'), false);
+  assert.equal(Object.hasOwn(queued[0], 'fingerprint'), false);
+  assert.equal(Object.hasOwn(queued[0], 'replyText'), false);
+
+  h.setIdleState('active');
+  await h.flush();
+
+  assert.equal(h.notifications.length, 2);
+  assert.equal(h.notifications[1].id, h.notifications[0].id);
+  assert.equal(h.notifications[1].options.message, '锁屏期间有一轮回复完成');
+  assert.equal(h.sessionStore.turnbellLockedReplayQueueV1.length, 0);
+});
+
+test('unlock recreates a locked Web Notification using the same tag', async () => {
+  const h = createHarness({ sound: false, notificationBackend: 'web' }, { idleState: 'locked' });
+  await h.sendRuntimeMessage({ type: 'turn-start', turnKey: 'turn-web-locked', userCount: 1, at: 10_000 });
+  const response = await h.sendRuntimeMessage(domCandidate('turn-web-locked'));
+  const initialTag = h.webNotifications[0].options.tag;
+
+  assert.equal(response.routes.web, true);
+  assert.equal(h.webNotifications.length, 1);
+  assert.equal(h.sessionStore.turnbellLockedReplayQueueV1.length, 1);
+
+  h.setIdleState('active');
+  await h.flush();
+
+  assert.equal(h.webNotifications.length, 1);
+  assert.equal(h.webNotifications[0].options.tag, initialTag);
+  assert.equal(h.webNotifications[0].options.body, '锁屏期间有一轮回复完成');
+  assert.equal(h.sessionStore.turnbellLockedReplayQueueV1.length, 0);
+});
+
+test('unlock racing the initial notification still produces only one replay', async () => {
+  const h = createHarness({ sound: false }, { idleState: 'locked' });
+  h.setNotificationCreateHook(() => h.setIdleState('active'));
+  await h.sendRuntimeMessage({ type: 'turn-start', turnKey: 'turn-unlock-race', userCount: 1, at: 10_000 });
+  await h.sendRuntimeMessage(domCandidate('turn-unlock-race'));
+  await h.flush();
+
+  assert.equal(h.notifications.length, 2);
+  assert.equal(h.notifications[1].options.message, '锁屏期间有一轮回复完成');
+  assert.equal(h.sessionStore.turnbellLockedReplayQueueV1.length, 0);
 });

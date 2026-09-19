@@ -4,8 +4,8 @@ TurnBell 是一个本地、隐私优先的 Chromium 扩展：当 ChatGPT 的一�
 
 **无需 EXE，不启动本地端口，不更换 Edge 配置，不读取 Cookie，不上传对话。**
 
-> 当前版本：**1.5.0**  
-> 实机测试范围：**Windows + Microsoft Edge / Google Chrome**。其他操作系统和浏览器尚未完成真实环境验证。
+> 当前版本：**1.5.1**
+> 1.5.0 基础功能实机测试：**Windows + Microsoft Edge / Google Chrome**。1.5.1 锁屏补发尚待真实设备验证。
 
 <p align="center">
   <img src="docs/images/notification-demo.webp" alt="TurnBell 完成通知效果示意" width="900">
@@ -19,6 +19,7 @@ TurnBell 是一个本地、隐私优先的 Chromium 扩展：当 ChatGPT 的一�
 
 - 支持普通回答以及 ChatGPT Instant / “极速”回复。
 - 切换到其他 Edge 标签页或其他应用后仍可提醒。
+- 锁屏期间完成的回复会在解锁后重新显示通知。
 - 刷新已有对话时只建立历史基线，不为旧回答误发通知。
 - 忽略推理摘要、搜索进度、工具状态和仍在变化的中间内容。
 - 每个检测到的用户轮次最多提醒一次，抑制重复完成信号。
@@ -177,6 +178,7 @@ notifications  创建 Edge 系统通知
 storage        保存本地设置和短期去重状态
 offscreen      仅在选择自定义音效时播放扩展包内 WAV
 scripting      给更新前已打开的 ChatGPT 标签页补注入本地脚本
+idle           判断系统是否锁屏，以便在解锁后补发完成通知
 ```
 
 站点权限仅限：

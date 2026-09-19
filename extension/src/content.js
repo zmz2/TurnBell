@@ -78,8 +78,8 @@
   let currentCompletionStartedAt = 0;
   let lastReportedGeneratingCompletionId = '';
   let pendingRouteRecovery = null;
-  let placeholderMigration = null;
-  let recentExplicitRouteNavigationAt = 0;
+  let routeHandshakePending = false;
+  let currentRoutePreviouslyCompleted = false;
   let recoveryLastFingerprint = '';
   let recoveryStableSince = 0;
   let recoveryStableSamples = 0;
@@ -97,16 +97,6 @@
 
   function routePath() {
     return `${String(location.pathname || '/')}${String(location.search || '')}`;
-  }
-
-  function isNewConversationPlaceholder(path) {
-    const pathname = String(path || '/').split('?', 1)[0].replace(/\/$/u, '') || '/';
-    return pathname === '/' || pathname === '/new' || pathname === '/c/new';
-  }
-
-  function isConversationRoute(path) {
-    const pathname = String(path || '/').split('?', 1)[0];
-    return /^\/c\/[^/]+$/u.test(pathname) && !isNewConversationPlaceholder(pathname);
   }
 
   function fallbackRouteHash(value) {
@@ -296,21 +286,26 @@
     return routeMessageQueue;
   }
 
-  function enterCurrentRoute({ fromPathHash = '', completionId = '' } = {}) {
+  function enterCurrentRoute() {
     const path = currentPath;
     const epoch = routeEpoch;
     const expectedCompletionGeneration = completionGeneration;
+    routeHandshakePending = true;
     void sendRouteMessage({
-      type: fromPathHash && completionId ? 'turn-move' : 'route-enter',
-      fromPathHash,
-      completionId,
+      type: 'route-enter',
       at: Date.now(),
     }, path, epoch, (response) => {
       if (
         path !== routePath()
         || epoch !== routeEpoch
-        || expectedCompletionGeneration !== completionGeneration
       ) return;
+      routeHandshakePending = false;
+      if (expectedCompletionGeneration !== completionGeneration) {
+        currentRoutePreviouslyCompleted = false;
+        scheduleSample(0);
+        return;
+      }
+      currentRoutePreviouslyCompleted = response?.previouslyCompleted === true;
       const pending = response?.pending && typeof response.pending === 'object'
         ? response.pending
         : null;
@@ -362,14 +357,6 @@
       recoveryLastFingerprint = '';
       recoveryStableSince = 0;
       recoveryStableSamples = 0;
-      if (source === 'explicit' && isNewConversationPlaceholder(currentPath)) {
-        placeholderMigration = {
-          completionId: currentCompletionId,
-          expiresAt: Date.now() + 30_000,
-        };
-      } else {
-        placeholderMigration = null;
-      }
     }
     sendRouteMessage({
       type: 'turn-start',
@@ -385,6 +372,7 @@
 
   function noteUserIntent(kind) {
     const at = Date.now();
+    currentRoutePreviouslyCompleted = false;
     if (pendingIntent && at - pendingIntent.at <= INTENT_DEDUPE_MS) {
       scheduleSample(0);
       return;
@@ -446,7 +434,6 @@
       if (response?.ok && (terminalSuppression || durablyHandled)) {
         pendingRouteRecovery = null;
         recoveryBaselineFingerprints.delete(String(completionId || ''));
-        if (placeholderMigration?.completionId === completionId) placeholderMigration = null;
       }
     });
   }
@@ -510,47 +497,18 @@
         recoveryBaselineFingerprints.delete(recoveryBaselineFingerprints.keys().next().value);
       }
     }
-    const migration = placeholderMigration;
-    const recentlyClickedConversationLink = now - recentExplicitRouteNavigationAt < 1_500;
-    const canAdoptPlaceholderTurn = Boolean(
-      migration
-      && migration.completionId === currentCompletionId
-      && migration.expiresAt >= now
-      && isNewConversationPlaceholder(oldPath)
-      && isConversationRoute(nextPath)
-      && !recentlyClickedConversationLink
-    );
     currentPath = nextPath;
     routeEpoch += 1;
+    currentRoutePreviouslyCompleted = false;
     lastSettleKey = '';
     pendingRouteRecovery = null;
     recoveryLastFingerprint = '';
     recoveryStableSince = 0;
     recoveryStableSamples = 0;
 
-    // A new conversation can be assigned its /c/<id> URL after the first DOM
-    // cycle, after the transient send intent has already been consumed.
-    if (canAdoptPlaceholderTurn) {
-      const newEpoch = routeEpoch;
-      const migratingCompletionId = currentCompletionId;
-      void routeHash(oldPath).then((fromPathHash) => {
-        if (
-          nextPath !== routePath()
-          || newEpoch !== routeEpoch
-          || migratingCompletionId !== currentCompletionId
-        ) return;
-        enterCurrentRoute({ fromPathHash, completionId: migratingCompletionId });
-        const snapshot = snapshotForCycle(state.cycleNumber);
-        announceTurn(currentTurnKey, snapshot, 'explicit');
-      });
-      log('SPA navigation adopted a fresh explicit turn', { routeEpoch });
-      return false;
-    }
-
     if ((state.phase !== 'idle' || recoveryWasPending) && currentCompletionId) {
       sendRouteMessage({ type: 'turn-suspend', completionId: currentCompletionId, at: now }, oldPath, oldEpoch, null, true);
     }
-    placeholderMigration = null;
     detector.reset();
     bootstrapGate.reset(now);
     currentTurnKey = '';
@@ -594,16 +552,11 @@
       && snapshot.fingerprint
       && snapshot.fingerprint !== baselineFingerprint
     );
-    const sameCountGenerationSeen = (
-      snapshot.assistantCount === baselineAssistantCount
-      && pending.sawGenerating === true
-    );
     if (
       snapshot.userCount < baselineUserCount
       || snapshot.assistantCount < baselineAssistantCount
       || (snapshot.assistantCount === baselineAssistantCount
-        && !sameCountFingerprintChanged
-        && !sameCountGenerationSeen)
+        && !sameCountFingerprintChanged)
     ) {
       recoveryLastFingerprint = '';
       recoveryStableSince = 0;
@@ -650,6 +603,7 @@
         return;
       }
       let snapshot = snapshotForCycle();
+      if (routeHandshakePending) return;
       sampleCount += 1;
       const sampleGapMs = lastSampleAt ? Math.max(0, snapshot.now - lastSampleAt) : 0;
       if (snapshot.fingerprint && snapshot.fingerprint !== lastObservedFingerprint) {
@@ -657,6 +611,15 @@
         lastObservedFingerprint = snapshot.fingerprint;
       }
       lastSampleAt = snapshot.now;
+      if (currentRoutePreviouslyCompleted && !pendingIntent && !pendingRouteRecovery) {
+        detector.reset();
+        currentTurnKey = '';
+        lastSentTurnKey = '';
+        lastDetectorCycle = 0;
+        lastReportedGeneratingCompletionId = '';
+        reportSampleState(snapshot, detector.getState(), sampleGapMs);
+        return;
+      }
       const bootstrap = bootstrapGate.evaluate({
         now: snapshot.now,
         readyState: document.readyState,
@@ -680,12 +643,14 @@
         evaluateRouteRecovery(snapshot);
         return;
       }
+      if (pendingRouteRecovery && evaluateRouteRecovery(snapshot)) {
+        reportSampleState(snapshot, detector.getState(), sampleGapMs);
+        return;
+      }
       const event = detector.step(snapshot);
       const state = detector.getState();
       handleCycleTransition(snapshot, state);
       reportSampleState(snapshot, state, sampleGapMs);
-
-      if (pendingRouteRecovery && evaluateRouteRecovery(snapshot)) return;
 
       if (
         state.sawGenerating === true
@@ -834,15 +799,6 @@
       noteUserIntent('enter');
     }, true);
     document.addEventListener('click', (event) => {
-      try {
-        const anchor = event?.target?.closest?.('a[href]');
-        if (anchor) {
-          const destination = new URL(String(anchor.href || ''), location.href);
-          if (destination.origin === location.origin && isConversationRoute(destination.pathname)) {
-            recentExplicitRouteNavigationAt = Date.now();
-          }
-        }
-      } catch { /* ignore malformed or synthetic link targets */ }
       const target = event?.target?.closest?.(USER_INTENT_SELECTOR);
       if (target) noteUserIntent('button');
     }, true);
@@ -854,10 +810,7 @@
     globalThis.addEventListener?.('pagehide', (event) => {
       reportLifecycle('pagehide', { persisted: event?.persisted === true });
     });
-    globalThis.addEventListener?.('popstate', () => {
-      recentExplicitRouteNavigationAt = Date.now();
-      scheduleSample(0);
-    });
+    globalThis.addEventListener?.('popstate', () => scheduleSample(0));
     globalThis.addEventListener?.('focus', () => {
       reportLifecycle('focus');
       lastSettleKey = '';

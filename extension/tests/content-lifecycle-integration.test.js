@@ -461,7 +461,7 @@ test('a delayed route-enter response cannot replace a completion created after t
   assert.equal(candidate?.completionId === 'stale-route-completion', false);
 });
 
-test('a placeholder turn moves to its generated conversation route after the first cycle', async () => {
+test('a placeholder route assignment suspends the old route and starts generation under the destination', async () => {
   const h = await createContentHarness({ pathname: '/' });
   h.setNow(2_000);
   h.pressEnter();
@@ -476,12 +476,93 @@ test('a placeholder turn moves to its generated conversation route after the fir
   h.setPath('/c/generated-conversation');
   await h.sampleNow();
   await h.flush();
+  h.setNow(2_200);
+  await h.sampleNow();
+  await h.flush();
 
-  const move = h.runtimeMessages.find((message) => message.type === 'turn-move');
-  assert.equal(move?.completionId, original.completionId);
+  const destinationStart = h.runtimeMessages.find((message) => (
+    message.type === 'turn-start'
+    && message.completionId !== original.completionId
+    && message.pathHash !== original.pathHash
+  ));
+  assert.ok(destinationStart?.completionId);
   assert.equal(h.runtimeMessages.some((message) => (
-    message.type === 'turn-suspend' && message.completionId === original.completionId
+    message.type === 'turn-suspend'
+    && message.completionId === original.completionId
+    && message.pathHash === original.pathHash
+  )), true);
+  assert.equal(h.runtimeMessages.some((message) => message.type === 'turn-move'), false);
+});
+
+test('a programmatic switch to an existing conversation never adopts the placeholder completion', async () => {
+  const h = await createContentHarness({ pathname: '/' });
+  h.setNow(3_000);
+  h.pressEnter();
+  h.setNow(3_100);
+  h.page.userTurns = [makeTurn('question from A', 'placeholder-user-a')];
+  h.page.generating = true;
+  await h.sampleNow();
+  await h.flush();
+  const original = h.runtimeMessages.find((message) => message.type === 'turn-start');
+  assert.ok(original?.completionId);
+
+  h.setPath('/c/existing-b');
+  h.page.userTurns = [makeTurn('old question from B', 'existing-user-b')];
+  h.page.assistantTurns = [makeTurn('old answer from B', 'existing-assistant-b')];
+  h.page.generating = false;
+  h.page.finalAction = true;
+  await h.sampleNow();
+  await h.flush();
+  h.setNow(5_200);
+  await h.sampleNow();
+  await h.flush();
+  h.setNow(7_000);
+  await h.sampleNow();
+
+  assert.equal(h.runtimeMessages.some((message) => message.type === 'turn-move'), false);
+  assert.equal(h.runtimeMessages.some((message) => (
+    message.type === 'turn-suspend'
+    && message.completionId === original.completionId
+    && message.pathHash === original.pathHash
+  )), true);
+  assert.equal(h.runtimeMessages.some((message) => (
+    message.type === 'dom-final-candidate' && message.completionId === original.completionId
   )), false);
+});
+
+test('a previously completed destination does not adopt a still-generating source DOM', async () => {
+  let routeEnterCount = 0;
+  const h = await createContentHarness({
+    pathname: '/c/a',
+    routeEnterResponder() {
+      routeEnterCount += 1;
+      return { ok: true, pending: null, previouslyCompleted: routeEnterCount > 1 };
+    },
+  });
+  h.setNow(2_000);
+  h.pressEnter();
+  h.setNow(2_100);
+  h.page.userTurns = [makeTurn('question from A', 'user-a')];
+  h.page.generating = true;
+  await h.sampleNow();
+  await h.flush();
+  const sourceStart = h.runtimeMessages.find((message) => message.type === 'turn-start');
+  assert.ok(sourceStart?.completionId);
+
+  h.setPath('/c/b');
+  await h.sampleNow();
+  await h.flush();
+  h.setNow(2_300);
+  await h.sampleNow();
+
+  const startIds = new Set(h.runtimeMessages
+    .filter((message) => message.type === 'turn-start')
+    .map((message) => message.completionId));
+  assert.equal(startIds.size, 1);
+  assert.equal(h.runtimeMessages.some((message) => (
+    message.type === 'dom-final-candidate' && message.completionId === sourceStart.completionId
+  )), false);
+  assert.equal(routeEnterCount, 2);
 });
 
 test('clicking an existing conversation from the placeholder is not mistaken for a new-turn route move', async () => {
@@ -550,5 +631,88 @@ test('route recovery accepts a changed same-count retry reply after stable final
   const candidate = h.runtimeMessages.find((message) => message.type === 'dom-final-candidate');
   assert.equal(candidate?.completionId, 'same-count-retry');
   assert.equal(candidate?.payload.event.finalEvidence, 'final-action');
+  assert.equal(routeEnterCount, 3);
+});
+
+test('an active recovered route keeps its persisted completion id while generation is visible', async () => {
+  const pending = {
+    completionId: 'recovered-active-completion',
+    startedAt: 1_000,
+    baselineUserCount: 1,
+    baselineAssistantCount: 0,
+    startSource: 'explicit',
+    sawGenerating: false,
+  };
+  const h = await createContentHarness({
+    pathname: '/c/recovered',
+    routeEnterResponder() { return { ok: true, pending }; },
+  });
+  h.page.userTurns = [makeTurn('recovered question', 'user-recovered')];
+  h.page.generating = true;
+  h.setNow(5_000);
+  await h.sampleNow();
+  await h.flush();
+
+  assert.equal(h.runtimeMessages.some((message) => (
+    message.type === 'turn-progress'
+    && message.completionId === 'recovered-active-completion'
+    && message.sawGenerating === true
+  )), true);
+  assert.equal(h.runtimeMessages.some((message) => (
+    message.type === 'turn-start' && message.completionId !== 'recovered-active-completion'
+  )), false);
+
+  h.page.generating = false;
+  h.page.assistantTurns = [makeTurn('the recovered answer', 'assistant-recovered')];
+  h.page.finalAction = true;
+  h.setNow(6_000);
+  await h.sampleNow();
+  h.setNow(7_300);
+  await h.sampleNow();
+
+  const candidate = h.runtimeMessages.find((message) => message.type === 'dom-final-candidate');
+  assert.equal(candidate?.completionId, 'recovered-active-completion');
+});
+
+test('route recovery does not reuse an old final action after same-count regeneration stops', async () => {
+  let routeEnterCount = 0;
+  const pending = {
+    completionId: 'same-count-unchanged',
+    startedAt: 1_000,
+    baselineUserCount: 1,
+    baselineAssistantCount: 1,
+    startSource: 'explicit',
+    sawGenerating: true,
+  };
+  const h = await createContentHarness({
+    pathname: '/c/a',
+    routeEnterResponder() {
+      routeEnterCount += 1;
+      return { ok: true, pending: routeEnterCount === 2 ? null : pending };
+    },
+  });
+  h.page.userTurns = [makeTurn('retry question', 'user-a')];
+  h.page.assistantTurns = [makeTurn('previous answer', 'assistant-a')];
+  h.page.finalAction = true;
+  h.setNow(5_000);
+  await h.sampleNow();
+  await h.flush();
+
+  h.setNow(6_000);
+  h.setPath('/c/b');
+  await h.sampleNow();
+  await h.flush();
+  h.setNow(7_000);
+  h.setPath('/c/a');
+  await h.sampleNow();
+  await h.flush();
+  h.setNow(9_001);
+  await h.sampleNow();
+  h.setNow(10_201);
+  await h.sampleNow();
+
+  assert.equal(h.runtimeMessages.some((message) => (
+    message.type === 'dom-final-candidate' && message.completionId === 'same-count-unchanged'
+  )), false);
   assert.equal(routeEnterCount, 3);
 });

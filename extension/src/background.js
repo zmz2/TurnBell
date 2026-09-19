@@ -12,6 +12,7 @@ const tabMonitor = globalThis.GPTReplyTabMonitor.createMonitor(chrome);
 
 const NOTIFICATION_PREFIX = 'turnbell-';
 const FINALIZATION_STORAGE_KEY = 'turnbellFinalizationV2';
+const NOTIFICATION_OUTBOX_KEY_PREFIX = 'notification-outbox:';
 const LAST_DIAGNOSTIC_KEY = 'turnbellLastNotificationDiagnostic';
 const LIFECYCLE_DIAGNOSTICS_KEY = 'turnbellLifecycleDiagnosticsV1';
 const WATCHDOG_ALARM = 'turnbell-active-turn-watchdog';
@@ -20,6 +21,10 @@ const LOCK_REPLAY_TTL_MS = 24 * 60 * 60 * 1_000;
 const LOCK_REPLAY_QUEUE_LIMIT = 20;
 const NOTIFICATION_RETRY_BASE_MS = 60 * 1_000;
 const NOTIFICATION_RETRY_MAX_MS = 15 * 60 * 1_000;
+const DOCUMENT_BOUND_MESSAGE_TYPES = new Set([
+  'turn-start', 'turn-progress', 'route-enter', 'turn-move', 'turn-suspend',
+  'dom-final-candidate', 'schedule-settle-check',
+]);
 const settleChecks = new Map();
 let offscreenCreation = null;
 let finalizationStorePromise = null;
@@ -133,11 +138,13 @@ function getNotificationPermissionLevel() {
 function getActiveNotifications() {
   return new Promise((resolve) => {
     if (typeof chrome.notifications.getAll !== 'function') {
-      resolve({});
+      resolve({ ok: false, items: {} });
       return;
     }
     chrome.notifications.getAll((items) => {
-      resolve(chrome.runtime.lastError ? {} : items || {});
+      resolve(chrome.runtime.lastError
+        ? { ok: false, items: {} }
+        : { ok: true, items: items || {} });
     });
   });
 }
@@ -154,7 +161,7 @@ async function showBrowserNotification(payload, settings) {
   const tabPart = Number.isInteger(payload.tabId) ? payload.tabId : 'unknown';
   const notificationId = String(payload.notificationId || `${NOTIFICATION_PREFIX}${tabPart}-${Date.now()}`);
   const activeBeforeCreate = await getActiveNotifications();
-  if (Object.hasOwn(activeBeforeCreate, notificationId)) {
+  if (activeBeforeCreate.ok && Object.hasOwn(activeBeforeCreate.items, notificationId)) {
     return {
       created: true,
       active: true,
@@ -208,14 +215,16 @@ async function showBrowserNotification(payload, settings) {
   }
 
   const activeItems = await getActiveNotifications();
-  const active = Object.hasOwn(activeItems, result.createdId);
+  const active = activeItems.ok ? Object.hasOwn(activeItems.items, result.createdId) : null;
   return {
     created: true,
     active,
     existing: false,
     id: result.createdId,
     permission,
-    diagnostic: active ? 'accepted-active' : 'accepted-not-active',
+    diagnostic: activeItems.ok
+      ? (active ? 'accepted-active' : 'accepted-not-active')
+      : 'accepted-active-unverified',
     error: '',
     createdAt: result.createdAt,
   };
@@ -488,10 +497,14 @@ async function enqueueLockedReplay(item) {
         replayNotificationId: String(item.replayNotificationId || ''),
         initialWebTag: String(item.initialWebTag || ''),
         replayWebTag: String(item.replayWebTag || ''),
+        notificationBackend: ['extension', 'web', 'both'].includes(String(item.notificationBackend || ''))
+          ? String(item.notificationBackend)
+          : 'extension',
         status: 'creating-initial',
         attempts: 0,
         expiresAt: now + LOCK_REPLAY_TTL_MS,
         tabClosed: false,
+        initialClosed: false,
       };
       queue.push(existing);
     }
@@ -552,26 +565,31 @@ async function acknowledgeLockedReplay(completionId) {
   if (item?.newlyAcknowledged) {
     await markNotificationDeliveredByCompletion(item.tabId, completionId);
     await clearReplayPair(item);
+    await refreshWatchdogAlarm();
   }
 }
 
 async function retryLockedReplayAfterInitialClose(completionId) {
-  const item = await getLockedReplay(completionId);
-  if (!item || item.status !== 'initial-active') return false;
-  await updateLockedReplay(completionId, (entry) => {
+  const item = await updateLockedReplay(completionId, (entry) => {
+    if (['acknowledged', 'replayed'].includes(String(entry.status))) return null;
+    entry.initialClosed = true;
     if (entry.status === 'initial-active') entry.status = 'pending';
-    return entry;
+    return { ...entry };
   });
+  if (!item) return false;
+  await refreshWatchdogAlarm();
   if (await queryIdleState() !== 'locked') await flushPendingLockedReplays();
   return true;
 }
 
 async function notificationWithTagExists(tag) {
-  if (!tag || typeof globalThis.registration?.getNotifications !== 'function') return false;
+  if (!tag || typeof globalThis.registration?.getNotifications !== 'function') {
+    return { ok: false, exists: false };
+  }
   try {
     const notifications = await globalThis.registration.getNotifications({ tag });
-    return Array.isArray(notifications) && notifications.length > 0;
-  } catch { return false; }
+    return { ok: true, exists: Array.isArray(notifications) && notifications.length > 0 };
+  } catch { return { ok: false, exists: false }; }
 }
 
 async function pendingReplayItems() {
@@ -584,7 +602,11 @@ async function pendingReplayItems() {
 }
 
 async function flushPendingLockedReplays() {
-  const run = lockReplayFlush.then(() => performPendingLockedReplayFlush());
+  const run = lockReplayFlush.then(async () => {
+    const result = await performPendingLockedReplayFlush();
+    await refreshWatchdogAlarm();
+    return result;
+  });
   lockReplayFlush = run.catch(() => undefined);
   return run;
 }
@@ -592,6 +614,7 @@ async function flushPendingLockedReplays() {
 async function performPendingLockedReplayFlush() {
   if (await queryIdleState() === 'locked') return { replayed: 0, locked: true };
   const items = await pendingReplayItems();
+  const settings = await getSettings();
   let replayed = 0;
   for (const snapshot of items) {
     if (await queryIdleState() === 'locked') return { replayed, locked: true };
@@ -599,10 +622,24 @@ async function performPendingLockedReplayFlush() {
     // A live request may still be creating the original notification. After a
     // worker restart this in-memory marker is gone, so the orphan is recovered.
     if (snapshot.status === 'creating-initial' && lockInitialNotificationsInFlight.has(snapshot.completionId)) continue;
-    if (snapshot.status === 'pending' && Date.now() - (Number(snapshot.lastAttemptAt) || 0) < 10_000) continue;
-    const activeNotifications = await getActiveNotifications();
-    const replayIsActive = Object.hasOwn(activeNotifications, snapshot.replayNotificationId)
-      || await notificationWithTagExists(snapshot.replayWebTag);
+    if (snapshot.status === 'pending'
+      && Number(snapshot.lastAttemptAt) > 0
+      && Date.now() - Number(snapshot.lastAttemptAt) < 10_000) continue;
+
+    const backend = ['extension', 'web', 'both'].includes(String(snapshot.notificationBackend || ''))
+      ? String(snapshot.notificationBackend)
+      : settings.notificationBackend;
+    const needsExtension = ['extension', 'both'].includes(backend);
+    const needsWeb = ['web', 'both'].includes(backend);
+    const [extensionState, webReplayState, webInitialState] = await Promise.all([
+      needsExtension ? getActiveNotifications() : Promise.resolve({ ok: true, items: {} }),
+      needsWeb ? notificationWithTagExists(snapshot.replayWebTag) : Promise.resolve({ ok: true, exists: false }),
+      needsWeb ? notificationWithTagExists(snapshot.initialWebTag) : Promise.resolve({ ok: true, exists: false }),
+    ]);
+    const replayIsActive = (
+      (extensionState.ok && Object.hasOwn(extensionState.items, snapshot.replayNotificationId))
+      || (webReplayState.ok && webReplayState.exists)
+    );
     if (replayIsActive) {
       await updateLockedReplay(snapshot.completionId, (entry) => {
         if (['acknowledged', 'replayed'].includes(String(entry.status))) return entry;
@@ -614,18 +651,31 @@ async function performPendingLockedReplayFlush() {
       continue;
     }
 
-    const initialIsActive = Object.hasOwn(activeNotifications, snapshot.initialNotificationId)
-      || await notificationWithTagExists(snapshot.initialWebTag);
+    const latestBeforeInitialCheck = await getLockedReplay(snapshot.completionId);
+    const initialClosed = latestBeforeInitialCheck?.initialClosed === true || snapshot.initialClosed === true;
+    const initialIsActive = !initialClosed && (
+      (extensionState.ok && Object.hasOwn(extensionState.items, snapshot.initialNotificationId))
+      || (webInitialState.ok && webInitialState.exists)
+    );
     if (initialIsActive) {
-      await updateLockedReplay(snapshot.completionId, (entry) => {
+      const markedActive = await updateLockedReplay(snapshot.completionId, (entry) => {
         if (['acknowledged', 'replayed'].includes(String(entry.status))) return entry;
+        if (entry.initialClosed) return entry;
         entry.status = 'initial-active';
         entry.initialActiveAt = entry.initialActiveAt || Date.now();
-        return entry;
+        return { ...entry };
       });
-      await markNotificationDeliveredByCompletion(snapshot.tabId, snapshot.completionId);
-      continue;
+      if (markedActive?.status === 'initial-active' && markedActive.initialClosed !== true) {
+        await markNotificationDeliveredByCompletion(snapshot.tabId, snapshot.completionId);
+        continue;
+      }
     }
+
+    // A failed activity query is unknown, not proof that a lock-screen alert
+    // disappeared. Keep the replay pending until every used channel can be
+    // checked successfully.
+    if ((needsExtension && !extensionState.ok)
+      || (needsWeb && (!webReplayState.ok || !webInitialState.ok))) continue;
 
     let tabClosed = snapshot.tabClosed === true;
     if (!tabClosed && Number.isInteger(snapshot.tabId)) tabClosed = !(await getTab(snapshot.tabId));
@@ -664,7 +714,6 @@ async function performPendingLockedReplayFlush() {
     payload.webTag = marked.replayWebTag;
     payload.completionId = marked.completionId;
     payload.notificationKind = 'unlock-replay';
-    const settings = await getSettings();
     const routes = await routeNotification(payload, settings);
     if (routes.browser || routes.web) {
       await updateLockedReplay(marked.completionId, (entry) => {
@@ -711,6 +760,39 @@ function finalizationKey(tabId, pathHash) {
   return `${tabId}:${safePathHash}`;
 }
 
+function notificationOutboxKey(tabId, completionId) {
+  return `${NOTIFICATION_OUTBOX_KEY_PREFIX}${tabId}:${encodeURIComponent(String(completionId || ''))}`;
+}
+
+function findNotificationState(store, tabId, pathHash, completionId) {
+  const id = String(completionId || '');
+  const routeKey = finalizationKey(tabId, pathHash);
+  const routeState = finalizationAPI.normalizeState(store[routeKey]);
+  if (routeState?.completionId === id) return { key: routeKey, state: routeState };
+
+  const outboxKey = notificationOutboxKey(tabId, id);
+  const outboxState = finalizationAPI.normalizeState(store[outboxKey]);
+  if (
+    outboxState?.completionId === id
+    && outboxState.tabId === tabId
+    && outboxState.pathHash === String(pathHash || '')
+  ) return { key: outboxKey, state: outboxState };
+  return null;
+}
+
+function preservePendingNotification(store, state) {
+  const normalized = finalizationAPI.normalizeState(state);
+  if (!normalized?.notified || normalized.notificationStatus !== 'pending') return false;
+  if (!Number.isInteger(normalized.tabId) || !normalized.completionId) return false;
+  const key = notificationOutboxKey(normalized.tabId, normalized.completionId);
+  const existing = finalizationAPI.normalizeState(store[key]);
+  if (existing?.completionId === normalized.completionId && existing.notificationStatus === 'pending') {
+    return true;
+  }
+  store[key] = normalized;
+  return true;
+}
+
 function pruneFinalizationStore(store, now = Date.now()) {
   for (const [key, rawState] of Object.entries(store)) {
     const state = finalizationAPI.normalizeState(rawState);
@@ -719,18 +801,28 @@ function pruneFinalizationStore(store, now = Date.now()) {
   }
 }
 
+async function mutableFinalizationStore() {
+  const store = { ...(await loadFinalizationStore()) };
+  pruneFinalizationStore(store);
+  return store;
+}
+
+async function saveFinalizationStore(store) {
+  if (!await sessionSet({ [FINALIZATION_STORAGE_KEY]: store })) {
+    throw new Error('finalization-store-write-failed');
+  }
+  finalizationStorePromise = Promise.resolve(store);
+}
+
 function mutateFinalization(tabId, pathHash, updater) {
   const run = finalizationMutation.then(async () => {
-    const store = await loadFinalizationStore();
-    pruneFinalizationStore(store);
+    const store = await mutableFinalizationStore();
     const key = finalizationKey(tabId, pathHash);
     const previous = store[key] || null;
     const result = updater(previous, store, key);
     if (result?.state) store[key] = result.state;
     else delete store[key];
-    if (!await sessionSet({ [FINALIZATION_STORAGE_KEY]: store })) {
-      throw new Error('finalization-store-write-failed');
-    }
+    await saveFinalizationStore(store);
     return { ...result, previous };
   });
   finalizationMutation = run.catch(() => undefined);
@@ -739,12 +831,9 @@ function mutateFinalization(tabId, pathHash, updater) {
 
 function queueFinalizationMutation(updater) {
   const run = finalizationMutation.then(async () => {
-    const store = await loadFinalizationStore();
-    pruneFinalizationStore(store);
+    const store = await mutableFinalizationStore();
     const result = await updater(store);
-    if (!await sessionSet({ [FINALIZATION_STORAGE_KEY]: store })) {
-      throw new Error('finalization-store-write-failed');
-    }
+    await saveFinalizationStore(store);
     return result;
   });
   finalizationMutation = run.catch(() => undefined);
@@ -767,7 +856,7 @@ function pendingRouteSummary(state) {
 }
 
 async function activeFinalizationEntries() {
-  const store = await loadFinalizationStore();
+  const store = { ...(await loadFinalizationStore()) };
   pruneFinalizationStore(store);
   const now = Date.now();
   return Object.entries(store).filter(([, state]) => (
@@ -782,7 +871,7 @@ async function activeFinalizationEntries() {
 }
 
 async function pendingNotificationEntries() {
-  const store = await loadFinalizationStore();
+  const store = { ...(await loadFinalizationStore()) };
   pruneFinalizationStore(store);
   const now = Date.now();
   return Object.entries(store).filter(([, state]) => (
@@ -805,6 +894,11 @@ async function markNotificationDeliveredByCompletion(tabId, completionId) {
       const state = finalizationAPI.normalizeState(rawState);
       if (!state || state.completionId !== id) continue;
       if (Number.isInteger(tabId) && state.tabId !== tabId) continue;
+      if (key.startsWith(NOTIFICATION_OUTBOX_KEY_PREFIX)) {
+        delete store[key];
+        updated = true;
+        continue;
+      }
       if (state.notificationStatus !== 'delivered') {
         state.notificationStatus = 'delivered';
         state.notificationRetryAt = 0;
@@ -827,6 +921,11 @@ async function markNotificationDeliveredById(notificationId) {
     for (const [key, rawState] of Object.entries(store)) {
       const state = finalizationAPI.normalizeState(rawState);
       if (!state || state.tabId !== tabId || completionToken(state.completionId) !== token) continue;
+      if (key.startsWith(NOTIFICATION_OUTBOX_KEY_PREFIX)) {
+        delete store[key];
+        updated = true;
+        continue;
+      }
       state.notificationStatus = 'delivered';
       state.notificationRetryAt = 0;
       store[key] = state;
@@ -837,15 +936,21 @@ async function markNotificationDeliveredById(notificationId) {
 }
 
 async function updateNotificationState(tabId, pathHash, completionId, update) {
-  const result = await mutateFinalization(tabId, pathHash, (rawState) => {
-    const state = finalizationAPI.normalizeState(rawState);
-    if (!state || state.completionId !== String(completionId || '')) {
-      return { state, action: { type: 'stale' } };
+  const result = await queueFinalizationMutation((store) => {
+    const found = findNotificationState(store, tabId, pathHash, completionId);
+    if (!found) return null;
+    update(found.state);
+    if (
+      found.key.startsWith(NOTIFICATION_OUTBOX_KEY_PREFIX)
+      && ['delivered', 'suppressed'].includes(found.state.notificationStatus)
+    ) {
+      delete store[found.key];
+    } else {
+      store[found.key] = found.state;
     }
-    update(state);
-    return { state, action: { type: 'updated' } };
+    return found.state;
   });
-  return result.state || null;
+  return result || null;
 }
 
 async function pruneExpiredFinalizationRecords() {
@@ -863,7 +968,8 @@ async function refreshWatchdogAlarm() {
   if (!chrome.alarms?.create) return false;
   const pendingTurns = await activeFinalizationEntries();
   const pendingNotifications = await pendingNotificationEntries();
-  if (pendingTurns.length === 0 && pendingNotifications.length === 0) {
+  const pendingLockedReplays = await pendingReplayItems();
+  if (pendingTurns.length === 0 && pendingNotifications.length === 0 && pendingLockedReplays.length === 0) {
     try { await chrome.alarms.clear(WATCHDOG_ALARM); } catch { /* optional on older builds */ }
     return false;
   }
@@ -881,6 +987,7 @@ async function refreshWatchdogAlarm() {
 async function runWatchdogAlarm() {
   await pruneExpiredFinalizationRecords();
   await flushPendingNotifications({ allowUnattempted: true });
+  await flushPendingLockedReplays();
   const pending = await activeFinalizationEntries();
   if (pending.length === 0) {
     await refreshWatchdogAlarm();
@@ -1055,6 +1162,7 @@ async function notifyFromFinal(tabId, action, event = {}, rawContext = {}) {
           replayNotificationId: ids.replay,
           initialWebTag: ids.initialWebTag,
           replayWebTag: ids.replayWebTag,
+          notificationBackend: settings.notificationBackend,
         });
       } catch (error) {
         lockInitialNotificationsInFlight.delete(completionId);
@@ -1107,7 +1215,9 @@ async function performPendingNotificationDelivery(tabId, pathHash, stateSnapshot
   const completionId = String(stateSnapshot?.completionId || '');
   if (!completionId) return { ok: false, reason: 'missing-completion-id' };
 
-  let state = finalizationAPI.normalizeState((await loadFinalizationStore())[finalizationKey(tabId, pathHash)]);
+  let state = findNotificationState(
+    await loadFinalizationStore(), tabId, pathHash, completionId,
+  )?.state || null;
   if (!state || state.completionId !== completionId || !state.notified || state.notificationStatus !== 'pending') {
     return { ok: true, notificationStatus: state?.notificationStatus || 'none', terminal: true };
   }
@@ -1129,8 +1239,9 @@ async function performPendingNotificationDelivery(tabId, pathHash, stateSnapshot
     if (lockItem) return { ok: true, notificationStatus: 'pending', deferred: true };
   }
 
-  const claimed = await mutateFinalization(tabId, pathHash, (rawState) => {
-    const current = finalizationAPI.normalizeState(rawState);
+  const claimed = await queueFinalizationMutation((store) => {
+    const found = findNotificationState(store, tabId, pathHash, completionId);
+    const current = found?.state || null;
     if (!current || current.completionId !== completionId || !current.notified
       || current.notificationStatus !== 'pending'
       || (current.notificationRetryAt > Date.now() && !(allowUnattempted && current.notificationAttempts === 0))) {
@@ -1138,6 +1249,7 @@ async function performPendingNotificationDelivery(tabId, pathHash, stateSnapshot
     }
     current.notificationAttempts += 1;
     current.notificationRetryAt = Date.now() + notificationRetryDelay(current.notificationAttempts);
+    store[found.key] = current;
     return { state: current, action: { type: 'claimed' } };
   });
   if (claimed.action.type !== 'claimed') {
@@ -1147,6 +1259,8 @@ async function performPendingNotificationDelivery(tabId, pathHash, stateSnapshot
 
   const retryContext = {
     tabId,
+    pageTitle: 'ChatGPT',
+    url: 'https://chatgpt.com/',
     tabHidden: state.tabHidden,
     preserveTabHidden: true,
   };
@@ -1201,11 +1315,10 @@ function deliverPendingNotification(tabId, pathHash, state, rawEventContext = {}
 async function flushPendingNotifications({ allowUnattempted = true } = {}) {
   const entries = await pendingNotificationEntries();
   let delivered = 0;
-  for (const [key, state] of entries) {
-    const separator = key.indexOf(':');
-    const tabId = Number(key.slice(0, separator));
-    const pathHash = key.slice(separator + 1);
-    if (!Number.isInteger(tabId)) continue;
+  for (const [, state] of entries) {
+    const tabId = Number(state.tabId);
+    const pathHash = String(state.pathHash || '');
+    if (!Number.isInteger(tabId) || !pathHash) continue;
     try {
       const response = await deliverPendingNotification(tabId, pathHash, state, {}, allowUnattempted);
       if (response?.notificationStatus === 'delivered') delivered += 1;
@@ -1222,19 +1335,24 @@ async function handleTurnStart(message, sender) {
   const pathHash = String(message.pathHash || '');
   const completionId = String(message.completionId || '');
   if (!pathHash || !completionId) return { ok: false, error: 'missing-route-identity' };
-  const result = await mutateFinalization(tabId, pathHash, (state) => finalizationAPI.beginTurn(state, {
-    tabId,
-    documentId: String(sender?.documentId || ''),
-    pathHash,
-    routeEpoch: Number(message.routeEpoch) || 0,
-    completionId,
-    at: Number(message.at) || Date.now(),
-    startedAt: Number(message.startedAt) || Number(message.at) || Date.now(),
-    userCount: Number(message.userCount) || 0,
-    assistantCount: Number(message.assistantCount) || 0,
-    tabHidden: message.tabHidden === true,
-    source: String(message.source || 'implicit'),
-  }));
+  const result = await mutateFinalization(tabId, pathHash, (state, store) => {
+    const previous = finalizationAPI.normalizeState(state);
+    const next = finalizationAPI.beginTurn(state, {
+      tabId,
+      documentId: String(sender?.documentId || ''),
+      pathHash,
+      routeEpoch: Number(message.routeEpoch) || 0,
+      completionId,
+      at: Number(message.at) || Date.now(),
+      startedAt: Number(message.startedAt) || Number(message.at) || Date.now(),
+      userCount: Number(message.userCount) || 0,
+      assistantCount: Number(message.assistantCount) || 0,
+      tabHidden: message.tabHidden === true,
+      source: String(message.source || 'implicit'),
+    });
+    if (next.action.type === 'new-turn') preservePendingNotification(store, previous);
+    return next;
+  });
   await refreshWatchdogAlarm();
   void recordLifecycleDiagnostic({
     type: 'turn-start', at: Number(message.at) || Date.now(), pathHash,
@@ -1275,8 +1393,11 @@ async function handleRouteEnter(message, sender) {
   const now = Date.now();
   const result = await mutateFinalization(tabId, pathHash, (rawState) => {
     const state = finalizationAPI.normalizeState(rawState);
-    if (!state || state.notified || (state.expiresAt && state.expiresAt <= now)) {
-      return { state: state?.notified ? state : null, action: { type: 'no-pending' } };
+    if (!state || (state.expiresAt && state.expiresAt <= now)) {
+      return { state: null, action: { type: 'no-pending' } };
+    }
+    if (state.notified) {
+      return { state, action: { type: 'no-pending', previouslyCompleted: true } };
     }
     state.documentId = String(sender?.documentId || state.documentId);
     state.routeEpoch = Math.max(0, Math.trunc(Number(message.routeEpoch) || 0));
@@ -1285,7 +1406,11 @@ async function handleRouteEnter(message, sender) {
     return { state, action: { type: 'pending', pending: pendingRouteSummary(state) } };
   });
   await refreshWatchdogAlarm();
-  return { ok: true, pending: result.action.pending || null };
+  return {
+    ok: true,
+    pending: result.action.pending || null,
+    previouslyCompleted: result.action.previouslyCompleted === true,
+  };
 }
 
 async function handleRouteMove(message, sender) {
@@ -1296,15 +1421,29 @@ async function handleRouteMove(message, sender) {
   if (!Number.isInteger(tabId) || !fromPathHash || !toPathHash || !completionId) {
     return { ok: false, error: 'missing-route-identity' };
   }
+  if (message.routeMoveEvidence !== 'shared-user-turn-node') {
+    return { ok: false, reason: 'unverified-route-move', pending: null };
+  }
   const result = await queueFinalizationMutation(async (store) => {
     const fromKey = finalizationKey(tabId, fromPathHash);
     const toKey = finalizationKey(tabId, toPathHash);
     const prior = finalizationAPI.normalizeState(store[fromKey]);
     const destination = finalizationAPI.normalizeState(store[toKey]);
-    if (prior?.completionId === completionId && !prior.notified) {
-      if (destination && !destination.notified && destination.completionId !== completionId) {
-        return { ok: false, reason: 'destination-active', pending: pendingRouteSummary(destination) };
+    if (destination && destination.completionId !== completionId) {
+      return { ok: false, reason: 'destination-owned', pending: pendingRouteSummary(destination) };
+    }
+    if (destination?.completionId === completionId) {
+      if (!destination.notified) {
+        destination.documentId = String(sender?.documentId || destination.documentId);
+        destination.routeEpoch = Math.max(0, Math.trunc(Number(message.routeEpoch) || 0));
+        destination.suspended = false;
+        destination.lastActivityAt = Math.max(destination.lastActivityAt, Date.now());
+        store[toKey] = destination;
       }
+      if (fromKey !== toKey) delete store[fromKey];
+      return { ok: true, pending: pendingRouteSummary(destination) };
+    }
+    if (prior?.completionId === completionId && !prior.notified) {
       prior.pathHash = toPathHash;
       prior.documentId = String(sender?.documentId || prior.documentId);
       prior.routeEpoch = Math.max(0, Math.trunc(Number(message.routeEpoch) || 0));
@@ -1364,7 +1503,7 @@ async function handleDomCandidate(message, sender) {
   const result = await mutateFinalization(tabId, pathHash, (state, store, currentKey) => {
     const completionIsRoutedElsewhere = Object.entries(store).some(([key, rawState]) => (
       key !== currentKey
-      && key.startsWith(`${tabId}:`)
+      && (key.startsWith(`${tabId}:`) || key === notificationOutboxKey(tabId, completionId))
       && finalizationAPI.normalizeState(rawState)?.completionId === completionId
     ));
     if (completionIsRoutedElsewhere) {
@@ -1507,7 +1646,12 @@ async function monitorStatus() {
 async function removeTabState(tabId) {
   await queueFinalizationMutation(async (store) => {
     for (const key of Object.keys(store)) {
-      if (key.startsWith(`${tabId}:`)) delete store[key];
+      if (!key.startsWith(`${tabId}:`)) continue;
+      const state = finalizationAPI.normalizeState(store[key]);
+      if (state?.notified && state.notificationStatus === 'pending') {
+        preservePendingNotification(store, state);
+      }
+      delete store[key];
     }
     return { ok: true };
   });
@@ -1548,6 +1692,14 @@ chrome.idle?.onStateChanged?.addListener((state) => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || message.target === 'offscreen') return false;
   const work = (async () => {
+    const documentLifecycle = sender?.documentLifecycle;
+    if (DOCUMENT_BOUND_MESSAGE_TYPES.has(String(message.type || ''))
+      && documentLifecycle !== undefined
+      && documentLifecycle !== null
+      && String(documentLifecycle) !== ''
+      && String(documentLifecycle) !== 'active') {
+      return { ok: false, error: 'inactive-document', documentLifecycle: String(documentLifecycle) };
+    }
     await ensureWorkerRecovered();
     switch (message.type) {
       case 'turn-start':
@@ -1634,6 +1786,7 @@ if (typeof globalThis.addEventListener === 'function') {
       }
       if (Number.isInteger(tabId)) await clearCompletionBadge(tabId);
       openChatGPT(Number.isInteger(tabId) ? tabId : null);
+      await recoverWorkerState();
     });
     event?.waitUntil?.(work);
   });
@@ -1648,34 +1801,50 @@ if (typeof globalThis.addEventListener === 'function') {
     } else if (completionId && data.notificationKind === 'unlock-replay') {
       work = acknowledgeLockedReplay(completionId);
     } else if (completionId && data.notificationKind === 'locked-initial') {
-      work = retryLockedReplayAfterInitialClose(completionId);
+      // The Web Notifications API fires `notificationclose` for a user close;
+      // treat it as acknowledgement instead of replaying a dismissed alert.
+      work = acknowledgeLockedReplay(completionId);
     }
-    event?.waitUntil?.(work);
+    event?.waitUntil?.(work.then(() => recoverWorkerState()));
   });
 }
 
 function parseLockedNotificationId(notificationId) {
-  const match = new RegExp(`^${NOTIFICATION_PREFIX}(\\d+)-lock-([a-z0-9-]+)-(?:initial|unlock)$`, 'iu')
+  const match = new RegExp(`^${NOTIFICATION_PREFIX}(\\d+)-lock-([a-z0-9-]+)-(initial|unlock)$`, 'iu')
     .exec(String(notificationId || ''));
-  return match ? { tabId: Number(match[1]), completionId: match[2] } : null;
+  return match
+    ? { tabId: Number(match[1]), completionId: match[2], kind: match[3].toLowerCase() }
+    : null;
 }
 
 chrome.notifications.onClicked.addListener((notificationId) => {
   const locked = parseLockedNotificationId(notificationId);
   const match = new RegExp(`^${NOTIFICATION_PREFIX}(\\d+)-`).exec(notificationId);
   const tabId = locked?.tabId ?? (match ? Number(match[1]) : null);
-  if (locked) void acknowledgeLockedReplay(locked.completionId);
-  else void markNotificationDeliveredById(notificationId);
-  if (Number.isInteger(tabId)) void clearCompletionBadge(tabId);
-  openChatGPT(tabId);
-  void clearNotification(notificationId);
+  void (async () => {
+    if (locked) await acknowledgeLockedReplay(locked.completionId);
+    else await markNotificationDeliveredById(notificationId);
+    if (Number.isInteger(tabId)) await clearCompletionBadge(tabId);
+    openChatGPT(tabId);
+    await clearNotification(notificationId);
+    await recoverWorkerState();
+  })().catch((error) => console.warn('[TurnBell] notification-click recovery failed', error));
 });
 
 chrome.notifications.onClosed?.addListener((notificationId, byUser) => {
   const locked = parseLockedNotificationId(notificationId);
-  if (locked && byUser === true) void acknowledgeLockedReplay(locked.completionId);
-  else if (locked) void retryLockedReplayAfterInitialClose(locked.completionId);
-  else if (!locked) void markNotificationDeliveredById(notificationId);
+  void (async () => {
+    if (locked?.kind === 'initial' && byUser === true) {
+      await acknowledgeLockedReplay(locked.completionId);
+    } else if (locked?.kind === 'initial') {
+      await retryLockedReplayAfterInitialClose(locked.completionId);
+    } else if (locked?.kind === 'unlock' && byUser === true) {
+      await acknowledgeLockedReplay(locked.completionId);
+    } else if (!locked) {
+      await markNotificationDeliveredById(notificationId);
+    }
+    await recoverWorkerState();
+  })().catch((error) => console.warn('[TurnBell] notification-close recovery failed', error));
 });
 
 chrome.tabs.onActivated.addListener((activeInfo) => {

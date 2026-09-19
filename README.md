@@ -178,6 +178,8 @@ notifications  创建 Edge 系统通知
 storage        保存本地设置和短期去重状态
 offscreen      仅在选择自定义音效时播放扩展包内 WAV
 scripting      给更新前已打开的 ChatGPT 标签页补注入本地脚本
+idle           仅检测系统锁定/解锁，以补发锁屏期间的完成提醒
+alarms         定期重采样活跃页面，并重试未送达通知；不会独立判定回复完成
 ```
 
 站点权限仅限：

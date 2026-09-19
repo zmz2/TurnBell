@@ -19,6 +19,11 @@
 
   function normalizeState(raw) {
     if (!raw || typeof raw !== 'object') return null;
+    const notified = Boolean(raw.notified);
+    const rawNotificationStatus = String(raw.notificationStatus || '');
+    const notificationStatus = ['none', 'pending', 'delivered', 'suppressed'].includes(rawNotificationStatus)
+      ? rawNotificationStatus
+      : (notified ? 'delivered' : 'none');
     return {
       tabId: Number.isInteger(raw.tabId) ? raw.tabId : null,
       cycleNumber: Math.max(1, Math.trunc(finite(raw.cycleNumber, 1))),
@@ -35,8 +40,12 @@
       sawGenerating: Boolean(raw.sawGenerating),
       suspended: Boolean(raw.suspended),
       expiresAt: Math.max(0, finite(raw.expiresAt, 0)),
-      notified: Boolean(raw.notified),
+      notified,
       notifiedAt: Math.max(0, finite(raw.notifiedAt, 0)),
+      notificationStatus,
+      notificationAttempts: Math.max(0, Math.trunc(finite(raw.notificationAttempts, 0))),
+      notificationRetryAt: Math.max(0, finite(raw.notificationRetryAt, 0)),
+      tabHidden: Boolean(raw.tabHidden),
     };
   }
 
@@ -63,6 +72,10 @@
       expiresAt: Math.max(at, finite(event.expiresAt, at + 24 * 60 * 60 * 1_000)),
       notified: false,
       notifiedAt: 0,
+      notificationStatus: 'none',
+      notificationAttempts: 0,
+      notificationRetryAt: 0,
+      tabHidden: event.tabHidden === true,
     };
   }
 
@@ -78,10 +91,13 @@
         ? 'explicit'
         : 'implicit';
       state.baselineUserCount = Math.max(state.baselineUserCount, Math.trunc(finite(event.userCount, state.baselineUserCount)));
-      state.baselineAssistantCount = Math.max(state.baselineAssistantCount, Math.trunc(finite(event.assistantCount, state.baselineAssistantCount)));
+      // Keep the original assistant baseline. Repeated turn-start messages can
+      // arrive after ChatGPT has inserted an empty/streaming assistant shell;
+      // folding that shell into the baseline makes A→B→A recovery impossible.
       state.startedAt = Math.min(state.startedAt || Number.MAX_SAFE_INTEGER, Math.max(0, finite(event.startedAt, state.startedAt)));
       if (!Number.isFinite(state.startedAt) || state.startedAt === Number.MAX_SAFE_INTEGER) state.startedAt = Math.max(0, finite(event.at, Date.now()));
       state.lastActivityAt = Math.max(state.lastActivityAt, Math.max(0, finite(event.at, Date.now())));
+      state.tabHidden = event.tabHidden === true || state.tabHidden;
       state.suspended = false;
       return { state, action: { type: 'update', reason: 'same-completion' } };
     }
@@ -131,6 +147,20 @@
       };
     }
 
+    if (state.notified && state.notificationStatus === 'pending') {
+      return {
+        state,
+        action: {
+          type: 'notify',
+          source: trustedActionlessFinal ? 'dom-fast-final' : 'dom-final',
+          cycleNumber: state.cycleNumber,
+          startedAt: state.startedAt,
+          completedAt: Math.max(state.lastActivityAt, candidateAt),
+          completionId: state.completionId,
+          reason: 'notification-pending',
+        },
+      };
+    }
     if (state.notified) {
       return { state, action: { type: 'suppress', reason: 'already-notified' } };
     }
@@ -141,6 +171,10 @@
     state.notifiedAt = at;
     state.phase = 'complete';
     state.suspended = false;
+    state.notificationStatus = 'pending';
+    state.notificationRetryAt = 0;
+    state.notificationAttempts = 0;
+    state.tabHidden = event.tabHidden === true || state.tabHidden;
     return {
       state,
       action: {

@@ -1,0 +1,51 @@
+TurnBell 1.5.1 Verification Record
+Date: 2026-09-19
+
+Scope
+- Extension-only Microsoft Edge / Chromium release.
+- No EXE, native helper, local server, remote script, network interception,
+  fetch/XMLHttpRequest wrapping, or webRequest permission.
+- Runtime host access is limited to chatgpt.com and chat.openai.com.
+
+Source verification
+- node --test extension/tests/*.test.js
+  Result: PASS, 93 tests, 0 failures.
+- node --check on every JavaScript file in extension/src.
+  Result: PASS.
+- python -m unittest discover -s scripts/tests -v
+  Result: PASS, 4 tests, 0 failures.
+- Python byte-compilation for scripts/*.py and scripts/tests/*.py.
+  Result: PASS.
+- git diff --check
+  Result: PASS.
+
+Regression coverage added for 1.5.1
+- Active turn watchdog alarms are restored after an ordinary service-worker
+  start and sample the exact tab, route, completion ID, and route epoch.
+- Failed notification creation stays pending and retries after the persisted
+  backoff; a stable active notification is detected after worker restart and is
+  neither recreated nor sounded again.
+- Unlock does not repeat an active initial notification. If it disappears
+  before or after unlock, TurnBell sends one generic replay; dismissing a locked
+  notification acknowledges the queue.
+- Repeated turn-start messages do not inflate the original assistant baseline.
+- Delayed route-enter responses cannot replace a newer completion. A new turn
+  started on a placeholder route moves after the conversation ID appears, while
+  deliberate navigation to an existing conversation suspends it.
+- A same-count regenerated reply can recover after A→B→A when its in-memory
+  fingerprint changed and final-render evidence remains stable.
+- Notification retry state does not persist page titles, URLs, reply text, or
+  fingerprints; Web Notification data does not contain a URL.
+
+Artifact verification
+- scripts/tests/test_package_layout.py builds extension, release, and project
+  archives in a temporary directory and verifies their layout and contents.
+- scripts/verify-artifacts.py checks the generated archives, manifest, runtime
+  parity, safe ZIP paths, and checksums.
+
+Environment and real-world test scope
+- Automated source, syntax, packaging, and artifact checks were performed in a
+  Windows development environment.
+- This patch has not been manually revalidated in a live Edge notification
+  session; OS notification presentation remains subject to Edge, Windows,
+  Focus/Do Not Disturb, per-app sound, and organization policy settings.

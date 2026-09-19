@@ -59,7 +59,7 @@ class PackageLayoutTest(unittest.TestCase):
             self.assertEqual(manifest["version"], VERSION)
             self.assertEqual(
                 set(manifest.get("permissions", [])),
-                {"notifications", "storage", "offscreen", "scripting"},
+                {"notifications", "storage", "offscreen", "scripting", "idle", "alarms"},
             )
             self.assertEqual(
                 set(manifest.get("host_permissions", [])),

@@ -16,7 +16,9 @@ test('runtime never patches page networking or parses ChatGPT response streams',
 
 test('final completion messages do not send reply text to the service worker', () => {
   const start = content.indexOf('function sendDomCandidate');
-  const end = content.indexOf('function settleKey', start);
+  const end = content.indexOf('function settlePlan', start);
   const candidateBody = start >= 0 && end > start ? content.slice(start, end) : '';
+  assert.ok(candidateBody.length > 0, 'sendDomCandidate must be scoped to the real function body');
   assert.doesNotMatch(candidateBody, /replyText|assistantText/u);
+  assert.doesNotMatch(candidateBody, /fingerprint|turnKey|textLength/u);
 });

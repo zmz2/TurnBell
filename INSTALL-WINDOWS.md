@@ -1,4 +1,4 @@
-# TurnBell 1.5.0：Windows + Microsoft Edge 安装、更新与排障
+# TurnBell 1.5.1：Windows + Microsoft Edge 安装、更新与排障
 
 ## 一、更新前清理
 
@@ -6,7 +6,7 @@
 2. 打开 `edge://extensions/`。
 3. 确认最终只保留一个 TurnBell 或旧“GPT 回复完成提醒器”。两个实例会造成重复提示音和通知。
 
-TurnBell 1.5.0 不安装 EXE、Windows 服务、驱动、计划任务、开机启动项或本地端口。
+TurnBell 1.5.1 不安装 EXE、Windows 服务、驱动、计划任务、开机启动项或本地端口。
 
 ## 二、安装或更新
 
@@ -34,7 +34,7 @@ Install-Or-Update-Current-Edge.cmd
 确认版本为：
 
 ```text
-1.5.0
+1.5.1
 ```
 
 ### 3. 刷新 ChatGPT 标签页
@@ -136,7 +136,7 @@ Windows 应用列表中没有 Edge，不能由扩展自行修复。若两个 Tur
 
 按顺序检查：
 
-1. 扩展卡片版本必须是 `1.5.0`；
+1. 扩展卡片版本必须是 `1.5.1`；
 2. `edge://extensions/` 中只能有一个 TurnBell/旧提醒扩展；
 3. 点击扩展卡片“重新加载”；
 4. 刷新发生问题的 ChatGPT 标签页；

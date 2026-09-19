@@ -18,6 +18,8 @@ const WATCHDOG_ALARM = 'turnbell-active-turn-watchdog';
 const LOCK_REPLAY_STORAGE_KEY = 'turnbellLockedReplayQueueV1';
 const LOCK_REPLAY_TTL_MS = 24 * 60 * 60 * 1_000;
 const LOCK_REPLAY_QUEUE_LIMIT = 20;
+const NOTIFICATION_RETRY_BASE_MS = 60 * 1_000;
+const NOTIFICATION_RETRY_MAX_MS = 15 * 60 * 1_000;
 const settleChecks = new Map();
 let offscreenCreation = null;
 let finalizationStorePromise = null;
@@ -25,7 +27,9 @@ let finalizationMutation = Promise.resolve();
 let diagnosticMutation = Promise.resolve();
 let lockReplayMutation = Promise.resolve();
 let lockReplayFlush = Promise.resolve();
+let workerRecoveryPromise = null;
 const lockInitialNotificationsInFlight = new Set();
+const notificationDeliveriesInFlight = new Map();
 
 function storageGet(defaults) {
   return new Promise((resolve) => {
@@ -147,6 +151,21 @@ function durationLabel(durationMs) {
 }
 
 async function showBrowserNotification(payload, settings) {
+  const tabPart = Number.isInteger(payload.tabId) ? payload.tabId : 'unknown';
+  const notificationId = String(payload.notificationId || `${NOTIFICATION_PREFIX}${tabPart}-${Date.now()}`);
+  const activeBeforeCreate = await getActiveNotifications();
+  if (Object.hasOwn(activeBeforeCreate, notificationId)) {
+    return {
+      created: true,
+      active: true,
+      existing: true,
+      id: notificationId,
+      permission: 'granted',
+      diagnostic: 'already-active',
+      error: '',
+      createdAt: 0,
+    };
+  }
   const permission = await getNotificationPermissionLevel();
   if (permission !== 'granted') {
     return {
@@ -159,8 +178,6 @@ async function showBrowserNotification(payload, settings) {
     };
   }
 
-  const tabPart = Number.isInteger(payload.tabId) ? payload.tabId : 'unknown';
-  const notificationId = String(payload.notificationId || `${NOTIFICATION_PREFIX}${tabPart}-${Date.now()}`);
   const result = await new Promise((resolve) => {
     chrome.notifications.create(notificationId, {
       type: 'basic',
@@ -195,6 +212,7 @@ async function showBrowserNotification(payload, settings) {
   return {
     created: true,
     active,
+    existing: false,
     id: result.createdId,
     permission,
     diagnostic: active ? 'accepted-active' : 'accepted-not-active',
@@ -217,6 +235,15 @@ async function showServiceWorkerNotification(payload, settings) {
   }
   const tag = String(payload.webTag || `turnbell-web-${Number.isInteger(payload.tabId) ? payload.tabId : 'unknown'}-${Date.now()}`);
   try {
+    if (typeof registrationObject.getNotifications === 'function') {
+      const existing = await registrationObject.getNotifications({ tag });
+      if (Array.isArray(existing) && existing.length > 0) {
+        return {
+          created: true, active: true, existing: true, permission: 'granted', tag,
+          diagnostic: 'web-already-active', error: '', createdAt: 0,
+        };
+      }
+    }
     await registrationObject.showNotification(payload.title, {
       body: payload.message,
       icon: chrome.runtime.getURL('assets/icons/icon-128.png'),
@@ -226,7 +253,6 @@ async function showServiceWorkerNotification(payload, settings) {
       silent: notificationAPI.notificationSilent(settings),
       data: {
         tabId: payload.tabId,
-        url: payload.url,
         completionId: String(payload.completionId || ''),
         notificationKind: String(payload.notificationKind || ''),
       },
@@ -237,7 +263,7 @@ async function showServiceWorkerNotification(payload, settings) {
       active = Array.isArray(notifications) ? notifications.length > 0 : true;
     }
     return {
-      created: true, active, permission: 'granted', tag,
+      created: true, active, existing: false, permission: 'granted', tag,
       diagnostic: active ? 'web-accepted-active' : 'web-accepted-not-active', error: '', createdAt: Date.now(),
     };
   } catch (error) {
@@ -284,14 +310,19 @@ async function routeNotification(payload, settings) {
   const webPromise = actions.includes('web')
     ? showServiceWorkerNotification(payload, settings)
     : Promise.resolve({ created: false, active: false, permission: 'skipped', diagnostic: 'skipped', error: '' });
-  const customSound = notificationAPI.shouldPlayCustomSound(settings);
-  const systemSoundRequested = settings.sound && settings.soundTheme === 'system';
-  const [browserResult, webResult, soundPlayed, badgeSet] = await Promise.all([
+  const [browserResult, webResult, badgeSet] = await Promise.all([
     extensionPromise,
     webPromise,
-    customSound ? playSound(settings.soundTheme, settings.soundVolume) : Promise.resolve(false),
     setCompletionBadge(payload.tabId),
   ]);
+  const hasNewNotification = browserResult.existing !== true
+    && webResult.existing !== true
+    && ((browserResult.created && browserResult.existing !== true)
+    || (webResult.created && webResult.existing !== true));
+  const soundPlayed = hasNewNotification && notificationAPI.shouldPlayCustomSound(settings)
+    ? await playSound(settings.soundTheme, settings.soundVolume)
+    : false;
+  const systemSoundRequested = settings.sound && settings.soundTheme === 'system';
   const routes = {
     browser: browserResult.created,
     browserActive: browserResult.active,
@@ -306,7 +337,7 @@ async function routeNotification(payload, settings) {
     webPermission: webResult.permission,
     webDiagnostic: webResult.diagnostic,
     webError: webResult.error,
-    systemSound: systemSoundRequested && (browserResult.created || webResult.created),
+    systemSound: systemSoundRequested && hasNewNotification,
     sound: Boolean(soundPlayed),
     badge: Boolean(badgeSet),
   };
@@ -357,12 +388,14 @@ function sendTabMessageBounded(tabId, message, timeoutMs = 3_000) {
   });
 }
 
-async function resolvedContext(tabId, rawContext = {}) {
+async function resolvedContext(tabId, rawContext = {}, preserveCapturedVisibility = false) {
   const tab = await getTab(tabId);
   const windowObject = tab ? await getWindow(tab.windowId) : null;
   const context = { ...rawContext, tabId };
-  if (tab && windowObject) context.tabHidden = !(Boolean(tab.active) && Boolean(windowObject.focused));
+  if (preserveCapturedVisibility) context.tabHidden = Boolean(rawContext.tabHidden);
+  else if (tab && windowObject) context.tabHidden = !(Boolean(tab.active) && Boolean(windowObject.focused));
   else context.tabHidden = Boolean(rawContext.tabHidden);
+  delete context.preserveTabHidden;
   context.pageTitle = String(context.pageTitle || tab?.title || 'ChatGPT');
   context.url = String(context.url || tab?.url || 'https://chatgpt.com/');
   context.hasFinalAction = context.hasFinalAction === true;
@@ -377,15 +410,31 @@ function withLockReplayMutation(updater) {
       ? items[LOCK_REPLAY_STORAGE_KEY]
       : [];
     const result = await updater(queue);
-    await localSet({ [LOCK_REPLAY_STORAGE_KEY]: queue });
+    if (!await localSet({ [LOCK_REPLAY_STORAGE_KEY]: queue })) {
+      throw new Error('locked-replay-store-write-failed');
+    }
     return result;
   });
   lockReplayMutation = run.catch(() => undefined);
   return run;
 }
 
+function completionToken(completionId) {
+  return String(completionId || '').replace(/[^a-z0-9-]/giu, '').slice(0, 72) || 'unknown';
+}
+
+function completionNotificationIds(tabId, completionId) {
+  const tabPart = Number.isInteger(tabId) ? tabId : 'unknown';
+  const token = completionToken(completionId);
+  return {
+    token,
+    notificationId: `${NOTIFICATION_PREFIX}${tabPart}-completion-${token}`,
+    webTag: `turnbell-web-${tabPart}-${token}`,
+  };
+}
+
 function lockNotificationIds(tabId, completionId) {
-  const token = String(completionId || '').replace(/[^a-z0-9-]/giu, '').slice(0, 72);
+  const token = completionToken(completionId);
   return {
     token,
     initial: `${NOTIFICATION_PREFIX}${Number.isInteger(tabId) ? tabId : 'unknown'}-lock-${token}-initial`,
@@ -495,11 +544,26 @@ async function clearReplayPair(item) {
 
 async function acknowledgeLockedReplay(completionId) {
   const item = await updateLockedReplay(completionId, (entry) => {
+    const newlyAcknowledged = entry.status !== 'acknowledged';
     entry.status = 'acknowledged';
-    entry.acknowledgedAt = Date.now();
-    return { ...entry };
+    if (newlyAcknowledged) entry.acknowledgedAt = Date.now();
+    return { ...entry, newlyAcknowledged };
   });
-  if (item) await clearReplayPair(item);
+  if (item?.newlyAcknowledged) {
+    await markNotificationDeliveredByCompletion(item.tabId, completionId);
+    await clearReplayPair(item);
+  }
+}
+
+async function retryLockedReplayAfterInitialClose(completionId) {
+  const item = await getLockedReplay(completionId);
+  if (!item || item.status !== 'initial-active') return false;
+  await updateLockedReplay(completionId, (entry) => {
+    if (entry.status === 'initial-active') entry.status = 'pending';
+    return entry;
+  });
+  if (await queryIdleState() !== 'locked') await flushPendingLockedReplays();
+  return true;
 }
 
 async function notificationWithTagExists(tag) {
@@ -550,6 +614,19 @@ async function performPendingLockedReplayFlush() {
       continue;
     }
 
+    const initialIsActive = Object.hasOwn(activeNotifications, snapshot.initialNotificationId)
+      || await notificationWithTagExists(snapshot.initialWebTag);
+    if (initialIsActive) {
+      await updateLockedReplay(snapshot.completionId, (entry) => {
+        if (['acknowledged', 'replayed'].includes(String(entry.status))) return entry;
+        entry.status = 'initial-active';
+        entry.initialActiveAt = entry.initialActiveAt || Date.now();
+        return entry;
+      });
+      await markNotificationDeliveredByCompletion(snapshot.tabId, snapshot.completionId);
+      continue;
+    }
+
     let tabClosed = snapshot.tabClosed === true;
     if (!tabClosed && Number.isInteger(snapshot.tabId)) tabClosed = !(await getTab(snapshot.tabId));
     const marked = await updateLockedReplay(snapshot.completionId, (entry) => {
@@ -596,6 +673,7 @@ async function performPendingLockedReplayFlush() {
         entry.replayedAt = Date.now();
         return entry;
       });
+      await markNotificationDeliveredByCompletion(marked.tabId, marked.completionId);
       replayed += 1;
     } else {
       await updateLockedReplay(marked.completionId, (entry) => {
@@ -633,15 +711,26 @@ function finalizationKey(tabId, pathHash) {
   return `${tabId}:${safePathHash}`;
 }
 
+function pruneFinalizationStore(store, now = Date.now()) {
+  for (const [key, rawState] of Object.entries(store)) {
+    const state = finalizationAPI.normalizeState(rawState);
+    if (!state || (state.expiresAt > 0 && state.expiresAt <= now)) delete store[key];
+    else store[key] = state;
+  }
+}
+
 function mutateFinalization(tabId, pathHash, updater) {
   const run = finalizationMutation.then(async () => {
     const store = await loadFinalizationStore();
+    pruneFinalizationStore(store);
     const key = finalizationKey(tabId, pathHash);
     const previous = store[key] || null;
     const result = updater(previous, store, key);
     if (result?.state) store[key] = result.state;
     else delete store[key];
-    await sessionSet({ [FINALIZATION_STORAGE_KEY]: store });
+    if (!await sessionSet({ [FINALIZATION_STORAGE_KEY]: store })) {
+      throw new Error('finalization-store-write-failed');
+    }
     return { ...result, previous };
   });
   finalizationMutation = run.catch(() => undefined);
@@ -651,8 +740,11 @@ function mutateFinalization(tabId, pathHash, updater) {
 function queueFinalizationMutation(updater) {
   const run = finalizationMutation.then(async () => {
     const store = await loadFinalizationStore();
+    pruneFinalizationStore(store);
     const result = await updater(store);
-    await sessionSet({ [FINALIZATION_STORAGE_KEY]: store });
+    if (!await sessionSet({ [FINALIZATION_STORAGE_KEY]: store })) {
+      throw new Error('finalization-store-write-failed');
+    }
     return result;
   });
   finalizationMutation = run.catch(() => undefined);
@@ -676,22 +768,102 @@ function pendingRouteSummary(state) {
 
 async function activeFinalizationEntries() {
   const store = await loadFinalizationStore();
+  pruneFinalizationStore(store);
   const now = Date.now();
   return Object.entries(store).filter(([, state]) => (
     state
     && !state.notified
     && !state.suspended
     && (!Number(state.expiresAt) || Number(state.expiresAt) > now)
-    && Number.isInteger(Number(state.tabId))
+    && Number.isInteger(state.tabId)
     && String(state.pathHash || '')
     && String(state.completionId || '')
   ));
 }
 
+async function pendingNotificationEntries() {
+  const store = await loadFinalizationStore();
+  pruneFinalizationStore(store);
+  const now = Date.now();
+  return Object.entries(store).filter(([, state]) => (
+    state
+    && state.notified
+    && state.notificationStatus === 'pending'
+    && (!state.expiresAt || state.expiresAt > now)
+    && Number.isInteger(state.tabId)
+    && String(state.pathHash || '')
+    && String(state.completionId || '')
+  ));
+}
+
+async function markNotificationDeliveredByCompletion(tabId, completionId) {
+  const id = String(completionId || '');
+  if (!id) return false;
+  return queueFinalizationMutation(async (store) => {
+    let updated = false;
+    for (const [key, rawState] of Object.entries(store)) {
+      const state = finalizationAPI.normalizeState(rawState);
+      if (!state || state.completionId !== id) continue;
+      if (Number.isInteger(tabId) && state.tabId !== tabId) continue;
+      if (state.notificationStatus !== 'delivered') {
+        state.notificationStatus = 'delivered';
+        state.notificationRetryAt = 0;
+        store[key] = state;
+        updated = true;
+      }
+    }
+    return updated;
+  });
+}
+
+async function markNotificationDeliveredById(notificationId) {
+  const match = new RegExp(`^${NOTIFICATION_PREFIX}(\\d+)-completion-([a-z0-9-]+)$`, 'iu')
+    .exec(String(notificationId || ''));
+  if (!match) return false;
+  const tabId = Number(match[1]);
+  const token = String(match[2]);
+  return queueFinalizationMutation(async (store) => {
+    let updated = false;
+    for (const [key, rawState] of Object.entries(store)) {
+      const state = finalizationAPI.normalizeState(rawState);
+      if (!state || state.tabId !== tabId || completionToken(state.completionId) !== token) continue;
+      state.notificationStatus = 'delivered';
+      state.notificationRetryAt = 0;
+      store[key] = state;
+      updated = true;
+    }
+    return updated;
+  });
+}
+
+async function updateNotificationState(tabId, pathHash, completionId, update) {
+  const result = await mutateFinalization(tabId, pathHash, (rawState) => {
+    const state = finalizationAPI.normalizeState(rawState);
+    if (!state || state.completionId !== String(completionId || '')) {
+      return { state, action: { type: 'stale' } };
+    }
+    update(state);
+    return { state, action: { type: 'updated' } };
+  });
+  return result.state || null;
+}
+
+async function pruneExpiredFinalizationRecords() {
+  const store = await loadFinalizationStore();
+  const now = Date.now();
+  const hasExpired = Object.values(store).some((rawState) => {
+    const state = finalizationAPI.normalizeState(rawState);
+    return !state || (state.expiresAt > 0 && state.expiresAt <= now);
+  });
+  if (!hasExpired) return false;
+  return queueFinalizationMutation(async () => ({ pruned: true }));
+}
+
 async function refreshWatchdogAlarm() {
   if (!chrome.alarms?.create) return false;
-  const pending = await activeFinalizationEntries();
-  if (pending.length === 0) {
+  const pendingTurns = await activeFinalizationEntries();
+  const pendingNotifications = await pendingNotificationEntries();
+  if (pendingTurns.length === 0 && pendingNotifications.length === 0) {
     try { await chrome.alarms.clear(WATCHDOG_ALARM); } catch { /* optional on older builds */ }
     return false;
   }
@@ -707,6 +879,8 @@ async function refreshWatchdogAlarm() {
 }
 
 async function runWatchdogAlarm() {
+  await pruneExpiredFinalizationRecords();
+  await flushPendingNotifications({ allowUnattempted: true });
   const pending = await activeFinalizationEntries();
   if (pending.length === 0) {
     await refreshWatchdogAlarm();
@@ -732,6 +906,26 @@ async function runWatchdogAlarm() {
     }, { tab: { id: state.tabId }, documentId: state.documentId });
   }
   await refreshWatchdogAlarm();
+}
+
+async function recoverWorkerState() {
+  try { await pruneExpiredFinalizationRecords(); }
+  catch (error) { console.warn('[TurnBell] expired-state pruning failed', error); }
+  try { await reconcileLockedReplayQueue(); }
+  catch (error) { console.warn('[TurnBell] locked-replay recovery failed', error); }
+  try { await flushPendingNotifications({ allowUnattempted: true }); }
+  catch (error) { console.warn('[TurnBell] notification outbox recovery failed', error); }
+  await refreshWatchdogAlarm();
+}
+
+function ensureWorkerRecovered() {
+  if (!workerRecoveryPromise) {
+    workerRecoveryPromise = recoverWorkerState().catch((error) => {
+      workerRecoveryPromise = null;
+      throw error;
+    });
+  }
+  return workerRecoveryPromise;
 }
 
 function clearSettleChecksForTab(tabId) {
@@ -816,46 +1010,65 @@ function recordLifecycleDiagnostic(event = {}, sender = {}) {
   return run;
 }
 
-async function notifyFromFinal(tabId, action, event = {}, rawContext = {}, force = false) {
+async function notifyFromFinal(tabId, action, event = {}, rawContext = {}) {
   const settings = await getSettings();
-  const context = await resolvedContext(tabId, rawContext);
-  if (!force && !notificationAPI.shouldNotify(settings, context)) {
-    return { ok: true, suppressed: true, reason: 'settings' };
-  }
+  const context = await resolvedContext(tabId, rawContext, rawContext.preserveTabHidden === true);
+  const completionId = String(action?.completionId || event?.completionId || '');
   const completedAt = Number(action?.completedAt) || Date.now();
   const startedAt = Math.min(Number(action?.startedAt) || completedAt, completedAt);
-  const completionId = String(action?.completionId || event?.completionId || '');
+  const durationMs = Math.max(0, completedAt - startedAt);
+  if (!notificationAPI.shouldNotify(settings, context)) {
+    return { ok: true, suppressed: true, reason: 'settings', notificationStatus: 'suppressed' };
+  }
+
+  const pendingLockItem = completionId ? await getLockedReplay(completionId) : null;
   const locked = await queryIdleState() === 'locked';
-  const payload = notificationAPI.makeNotificationPayload({
-    durationMs: Math.max(0, completedAt - startedAt),
-  }, context);
-  let lockItem = null;
+  const lockMode = locked || Boolean(pendingLockItem);
+  const payload = notificationAPI.makeNotificationPayload({ durationMs }, context);
+  let lockItem = pendingLockItem;
   let initialInFlight = false;
-  if (locked && completionId) {
+
+  if (lockMode && completionId) {
+    if (['initial-active', 'replayed', 'acknowledged'].includes(String(lockItem?.status))) {
+      return {
+        ok: true,
+        terminal: true,
+        notificationStatus: 'delivered',
+        routes: { browser: false, web: false },
+      };
+    }
     const ids = lockNotificationIds(tabId, completionId);
     payload.notificationId = ids.initial;
     payload.webTag = ids.initialWebTag;
     payload.completionId = completionId;
     payload.notificationKind = 'locked-initial';
-    lockInitialNotificationsInFlight.add(completionId);
-    initialInFlight = true;
-    try {
-      lockItem = await enqueueLockedReplay({
-        completionId,
-        tabId,
-        completedAt,
-        durationMs: Math.max(0, completedAt - startedAt),
-        initialNotificationId: ids.initial,
-        replayNotificationId: ids.replay,
-        initialWebTag: ids.initialWebTag,
-        replayWebTag: ids.replayWebTag,
-      });
-    } catch (error) {
-      lockInitialNotificationsInFlight.delete(completionId);
-      initialInFlight = false;
-      throw error;
+    if (!lockItem) {
+      lockInitialNotificationsInFlight.add(completionId);
+      initialInFlight = true;
+      try {
+        lockItem = await enqueueLockedReplay({
+          completionId,
+          tabId,
+          completedAt,
+          durationMs,
+          initialNotificationId: ids.initial,
+          replayNotificationId: ids.replay,
+          initialWebTag: ids.initialWebTag,
+          replayWebTag: ids.replayWebTag,
+        });
+      } catch (error) {
+        lockInitialNotificationsInFlight.delete(completionId);
+        throw error;
+      }
     }
+  } else {
+    const ids = completionNotificationIds(tabId, completionId);
+    payload.notificationId = ids.notificationId;
+    payload.webTag = ids.webTag;
+    payload.completionId = completionId;
+    payload.notificationKind = 'completion';
   }
+
   let routes;
   try {
     routes = await routeNotification(payload, settings);
@@ -864,8 +1077,6 @@ async function notifyFromFinal(tabId, action, event = {}, rawContext = {}, force
   }
   if (lockItem) {
     await updateLockedReplay(completionId, (entry) => {
-      // An unlock handler may already have recovered and replayed this record.
-      // Only the creator that owns the initial state may advance it to pending.
       if (entry.status === 'creating-initial') {
         entry.status = 'pending';
         entry.initialNotificationId = String(routes.notificationId || payload.notificationId || '');
@@ -874,8 +1085,135 @@ async function notifyFromFinal(tabId, action, event = {}, rawContext = {}, force
       return entry;
     });
     if (await queryIdleState() !== 'locked') await flushPendingLockedReplays();
+    const latestLockItem = await getLockedReplay(completionId);
+    if (lockedReplayIsTerminal(latestLockItem)) {
+      await markNotificationDeliveredByCompletion(tabId, completionId);
+      return { ok: true, terminal: true, notificationStatus: 'delivered', payload, routes };
+    }
   }
   return { ok: true, payload, routes };
+}
+
+function notificationRetryDelay(attempts) {
+  const exponent = Math.max(0, Math.min(8, Number(attempts) - 1));
+  return Math.min(NOTIFICATION_RETRY_MAX_MS, NOTIFICATION_RETRY_BASE_MS * (2 ** exponent));
+}
+
+function lockedReplayIsTerminal(item) {
+  return Boolean(item && ['initial-active', 'replayed', 'acknowledged'].includes(String(item.status)));
+}
+
+async function performPendingNotificationDelivery(tabId, pathHash, stateSnapshot, rawEventContext = {}, allowUnattempted = false) {
+  const completionId = String(stateSnapshot?.completionId || '');
+  if (!completionId) return { ok: false, reason: 'missing-completion-id' };
+
+  let state = finalizationAPI.normalizeState((await loadFinalizationStore())[finalizationKey(tabId, pathHash)]);
+  if (!state || state.completionId !== completionId || !state.notified || state.notificationStatus !== 'pending') {
+    return { ok: true, notificationStatus: state?.notificationStatus || 'none', terminal: true };
+  }
+  const now = Date.now();
+  if (state.notificationRetryAt > now && !(allowUnattempted && state.notificationAttempts === 0)) {
+    return { ok: true, notificationStatus: 'pending', deferred: true };
+  }
+
+  let lockItem = await getLockedReplay(completionId);
+  if (lockItem && await queryIdleState() !== 'locked') {
+    await flushPendingLockedReplays();
+    lockItem = await getLockedReplay(completionId);
+    if (lockedReplayIsTerminal(lockItem)) {
+      await markNotificationDeliveredByCompletion(tabId, completionId);
+      return { ok: true, terminal: true, notificationStatus: 'delivered' };
+    }
+    // An unlocked, still-pending lock record owns its retry path. Retrying the
+    // original alert here could replace or race the generic unlock replay.
+    if (lockItem) return { ok: true, notificationStatus: 'pending', deferred: true };
+  }
+
+  const claimed = await mutateFinalization(tabId, pathHash, (rawState) => {
+    const current = finalizationAPI.normalizeState(rawState);
+    if (!current || current.completionId !== completionId || !current.notified
+      || current.notificationStatus !== 'pending'
+      || (current.notificationRetryAt > Date.now() && !(allowUnattempted && current.notificationAttempts === 0))) {
+      return { state: current, action: { type: 'not-due' } };
+    }
+    current.notificationAttempts += 1;
+    current.notificationRetryAt = Date.now() + notificationRetryDelay(current.notificationAttempts);
+    return { state: current, action: { type: 'claimed' } };
+  });
+  if (claimed.action.type !== 'claimed') {
+    return { ok: true, notificationStatus: claimed.state?.notificationStatus || 'pending', deferred: true };
+  }
+  state = finalizationAPI.normalizeState(claimed.state);
+
+  const retryContext = {
+    tabId,
+    tabHidden: state.tabHidden,
+    preserveTabHidden: true,
+  };
+  const eventContext = Object.keys(rawEventContext || {}).length > 0
+    ? { ...rawEventContext, preserveTabHidden: false }
+    : retryContext;
+  let response;
+  try {
+    const resolved = await resolvedContext(tabId, eventContext, eventContext.preserveTabHidden === true);
+    await updateNotificationState(tabId, pathHash, completionId, (current) => {
+      current.tabHidden = resolved.tabHidden;
+    });
+    response = await notifyFromFinal(tabId, {
+      completionId,
+      startedAt: state.startedAt,
+      completedAt: state.notifiedAt || state.lastActivityAt,
+    }, {}, resolved.preserveTabHidden === true
+      ? resolved
+      : { ...resolved, preserveTabHidden: true });
+  } catch (error) {
+    response = { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+
+  if (response?.notificationStatus === 'suppressed') {
+    await updateNotificationState(tabId, pathHash, completionId, (current) => {
+      current.notificationStatus = 'suppressed';
+      current.notificationRetryAt = 0;
+    });
+    return { ...response, notificationStatus: 'suppressed' };
+  }
+  if (response?.terminal || response?.routes?.browser || response?.routes?.web) {
+    await updateNotificationState(tabId, pathHash, completionId, (current) => {
+      current.notificationStatus = 'delivered';
+      current.notificationRetryAt = 0;
+    });
+    return { ...response, notificationStatus: 'delivered' };
+  }
+  return { ...response, notificationStatus: 'pending', deliveryPending: true };
+}
+
+function deliverPendingNotification(tabId, pathHash, state, rawEventContext = {}, allowUnattempted = false) {
+  const completionId = String(state?.completionId || '');
+  const key = `${tabId}:${pathHash}:${completionId}`;
+  if (notificationDeliveriesInFlight.has(key)) return notificationDeliveriesInFlight.get(key);
+  const work = performPendingNotificationDelivery(
+    tabId, pathHash, state, rawEventContext, allowUnattempted,
+  ).finally(() => notificationDeliveriesInFlight.delete(key));
+  notificationDeliveriesInFlight.set(key, work);
+  return work;
+}
+
+async function flushPendingNotifications({ allowUnattempted = true } = {}) {
+  const entries = await pendingNotificationEntries();
+  let delivered = 0;
+  for (const [key, state] of entries) {
+    const separator = key.indexOf(':');
+    const tabId = Number(key.slice(0, separator));
+    const pathHash = key.slice(separator + 1);
+    if (!Number.isInteger(tabId)) continue;
+    try {
+      const response = await deliverPendingNotification(tabId, pathHash, state, {}, allowUnattempted);
+      if (response?.notificationStatus === 'delivered') delivered += 1;
+    } catch (error) {
+      console.warn('[TurnBell] pending notification retry failed', error);
+    }
+  }
+  return { delivered, remaining: Math.max(0, entries.length - delivered) };
 }
 
 async function handleTurnStart(message, sender) {
@@ -894,6 +1232,7 @@ async function handleTurnStart(message, sender) {
     startedAt: Number(message.startedAt) || Number(message.at) || Date.now(),
     userCount: Number(message.userCount) || 0,
     assistantCount: Number(message.assistantCount) || 0,
+    tabHidden: message.tabHidden === true,
     source: String(message.source || 'implicit'),
   }));
   await refreshWatchdogAlarm();
@@ -1041,6 +1380,7 @@ async function handleDomCandidate(message, sender) {
       startedAt: Number(event.startedAt) || 0,
       userCount: Number(context.userCount) || 0,
       assistantCount: Number(context.assistantCount) || 0,
+      tabHidden: context.tabHidden === true,
       hasFinalAction,
       finalEvidence: String(event.finalEvidence || (hasFinalAction ? 'final-action' : '')),
     });
@@ -1055,12 +1395,23 @@ async function handleDomCandidate(message, sender) {
   if (result.action.type !== 'notify') {
     return { ok: true, suppressed: true, reason: result.action.reason || 'not-final' };
   }
-  const response = await notifyFromFinal(tabId, result.action, event, context);
+  let response;
+  try {
+    response = await deliverPendingNotification(tabId, pathHash, result.state, context, true);
+  } catch (error) {
+    response = {
+      ok: true,
+      notificationStatus: 'pending',
+      deliveryPending: true,
+    };
+  }
   void recordLifecycleDiagnostic({
     type: 'notification-created', at: Date.now(), observedAt: Number(event.completedAt) || 0,
     notificationCreatedAt: Number(response?.routes?.notificationCreatedAt) || 0,
     pathHash, routeEpoch: Number(message.routeEpoch) || 0,
-    lifecycle: response?.routes?.browser || response?.routes?.web ? 'created' : 'failed',
+    lifecycle: response?.notificationStatus === 'delivered'
+      ? 'created'
+      : (response?.notificationStatus === 'suppressed' ? 'suppressed' : 'failed'),
   }, sender);
   await refreshWatchdogAlarm();
   return response;
@@ -1168,32 +1519,36 @@ chrome.runtime.onInstalled.addListener(() => {
   void (async () => {
     await ensureDefaultSettings();
     await injectExistingChatGPTTabs();
-    await refreshWatchdogAlarm();
-    await reconcileLockedReplayQueue();
-  })();
+    await ensureWorkerRecovered();
+  })().catch((error) => console.warn('[TurnBell] install recovery failed', error));
 });
 
 chrome.runtime.onStartup.addListener(() => {
   void (async () => {
     await ensureDefaultSettings();
     await injectExistingChatGPTTabs();
-    await refreshWatchdogAlarm();
-    await reconcileLockedReplayQueue();
-  })();
+    await ensureWorkerRecovered();
+  })().catch((error) => console.warn('[TurnBell] startup recovery failed', error));
 });
 
 chrome.alarms?.onAlarm?.addListener((alarm) => {
-  if (alarm?.name === WATCHDOG_ALARM) void runWatchdogAlarm();
+  if (alarm?.name === WATCHDOG_ALARM) {
+    void ensureWorkerRecovered().then(runWatchdogAlarm)
+      .catch((error) => console.warn('[TurnBell] watchdog recovery failed', error));
+  }
 });
 
 chrome.idle?.setDetectionInterval?.(15);
 chrome.idle?.onStateChanged?.addListener((state) => {
-  void handleIdleStateChanged(String(state || 'unknown'));
+  void ensureWorkerRecovered()
+    .then(() => handleIdleStateChanged(String(state || 'unknown')))
+    .catch((error) => console.warn('[TurnBell] idle recovery failed', error));
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || message.target === 'offscreen') return false;
   const work = (async () => {
+    await ensureWorkerRecovered();
     switch (message.type) {
       case 'turn-start':
         return handleTurnStart(message, sender);
@@ -1270,12 +1625,31 @@ if (typeof globalThis.addEventListener === 'function') {
   globalThis.addEventListener('notificationclick', (event) => {
     const data = event?.notification?.data || {};
     event?.notification?.close?.();
-    const work = Promise.resolve().then(() => {
+    const work = Promise.resolve().then(async () => {
       const tabId = Number(data.tabId);
-      if (data.completionId) void acknowledgeLockedReplay(String(data.completionId));
-      if (Number.isInteger(tabId)) void clearCompletionBadge(tabId);
+      if (data.completionId && ['locked-initial', 'unlock-replay'].includes(String(data.notificationKind || ''))) {
+        await acknowledgeLockedReplay(String(data.completionId));
+      } else if (data.completionId) {
+        await markNotificationDeliveredByCompletion(tabId, String(data.completionId));
+      }
+      if (Number.isInteger(tabId)) await clearCompletionBadge(tabId);
       openChatGPT(Number.isInteger(tabId) ? tabId : null);
     });
+    event?.waitUntil?.(work);
+  });
+
+  globalThis.addEventListener('notificationclose', (event) => {
+    const data = event?.notification?.data || {};
+    const completionId = String(data.completionId || '');
+    const tabId = Number(data.tabId);
+    let work = Promise.resolve();
+    if (completionId && data.notificationKind === 'completion') {
+      work = markNotificationDeliveredByCompletion(Number.isInteger(tabId) ? tabId : null, completionId);
+    } else if (completionId && data.notificationKind === 'unlock-replay') {
+      work = acknowledgeLockedReplay(completionId);
+    } else if (completionId && data.notificationKind === 'locked-initial') {
+      work = retryLockedReplayAfterInitialClose(completionId);
+    }
     event?.waitUntil?.(work);
   });
 }
@@ -1291,6 +1665,7 @@ chrome.notifications.onClicked.addListener((notificationId) => {
   const match = new RegExp(`^${NOTIFICATION_PREFIX}(\\d+)-`).exec(notificationId);
   const tabId = locked?.tabId ?? (match ? Number(match[1]) : null);
   if (locked) void acknowledgeLockedReplay(locked.completionId);
+  else void markNotificationDeliveredById(notificationId);
   if (Number.isInteger(tabId)) void clearCompletionBadge(tabId);
   openChatGPT(tabId);
   void clearNotification(notificationId);
@@ -1299,12 +1674,18 @@ chrome.notifications.onClicked.addListener((notificationId) => {
 chrome.notifications.onClosed?.addListener((notificationId, byUser) => {
   const locked = parseLockedNotificationId(notificationId);
   if (locked && byUser === true) void acknowledgeLockedReplay(locked.completionId);
+  else if (locked) void retryLockedReplayAfterInitialClose(locked.completionId);
+  else if (!locked) void markNotificationDeliveredById(notificationId);
 });
 
 chrome.tabs.onActivated.addListener((activeInfo) => {
-  if (Number.isInteger(activeInfo?.tabId)) void clearCompletionBadge(activeInfo.tabId);
+  void ensureWorkerRecovered().then(() => {
+    if (Number.isInteger(activeInfo?.tabId)) return clearCompletionBadge(activeInfo.tabId);
+    return false;
+  }).catch((error) => console.warn('[TurnBell] tab activation recovery failed', error));
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  void removeTabState(tabId);
+  void ensureWorkerRecovered().then(() => removeTabState(tabId))
+    .catch((error) => console.warn('[TurnBell] tab removal recovery failed', error));
 });

@@ -21,14 +21,14 @@ function createEvent() {
 }
 
 function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
-  let clock = 10_000;
+  let clock = Number(environmentOverrides.now) || 10_000;
   let nextTimerId = 1;
   const timers = new Map();
   const notifications = [];
   const deferredNotificationCreates = [];
-  const activeNotifications = {};
+  const activeNotifications = environmentOverrides.activeNotifications || {};
   const localStore = environmentOverrides.localStore || {};
-  const alarmsStore = {};
+  const alarmsStore = environmentOverrides.alarmsStore || {};
   const badgeCalls = [];
   const soundMessages = [];
   const tabMessages = [];
@@ -48,7 +48,9 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
     debug: false,
     ...settingsOverrides,
   };
-  const sessionStore = {};
+  const sessionStore = environmentOverrides.sessionStore || {};
+  const globalEventListeners = new Map();
+  let failedNotificationCreates = Math.max(0, Number(environmentOverrides.failedNotificationCreates) || 0);
   const tabActive = environmentOverrides.tabActive ?? false;
   const windowFocused = environmentOverrides.windowFocused ?? true;
   let idleState = environmentOverrides.idleState || 'active';
@@ -108,14 +110,21 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
       getPermissionLevel(callback) { callback(environmentOverrides.permission || 'granted'); },
       create(id, options, callback) {
         notifications.push({ id, options });
-        if (environmentOverrides.deferNotificationCreate === true) {
-          deferredNotificationCreates.push(() => {
-            activeNotifications[id] = options;
+        const finish = () => {
+          if (failedNotificationCreates > 0) {
+            failedNotificationCreates -= 1;
+            runtime.lastError = { message: 'test-create-failed' };
             callback(id);
-          });
-        } else {
+            runtime.lastError = null;
+            return;
+          }
           activeNotifications[id] = options;
           callback(id);
+        };
+        if (environmentOverrides.deferNotificationCreate === true) {
+          deferredNotificationCreates.push(finish);
+        } else {
+          finish();
         }
       },
       getAll(callback) { callback({ ...activeNotifications }); },
@@ -176,7 +185,10 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
         return webNotifications.filter((item) => !item.closed && (!tag || item.options.tag === tag));
       },
     },
-    addEventListener() {},
+    addEventListener(type, listener) {
+      if (!globalEventListeners.has(type)) globalEventListeners.set(type, []);
+      globalEventListeners.get(type).push(listener);
+    },
     clients: { matchAll() { return Promise.resolve([]); } },
     setTimeout(callback, delay = 0) {
       const id = nextTimerId++;
@@ -211,7 +223,20 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
       events.onIdleStateChanged.dispatch(value);
       await flushTurns(12);
     },
-    async flush() { await flushTurns(); },
+    async closeNotification(id, byUser = false) {
+      delete activeNotifications[id];
+      events.onClosed.dispatch(id, byUser);
+      await flushTurns(12);
+    },
+    async dispatchGlobalNotificationEvent(type, notificationData) {
+      const waits = [];
+      for (const listener of globalEventListeners.get(type) || []) {
+        listener({ notification: { data: notificationData, close() {} }, waitUntil(promise) { waits.push(promise); } });
+      }
+      await Promise.all(waits);
+      await flushTurns(12);
+    },
+    async flush() { await flushTurns(12); },
     async runNextTimer() {
       const entry = [...timers.entries()].sort((a, b) => a[1].at - b[1].at)[0];
       if (!entry) return false;
@@ -315,6 +340,92 @@ test('a selected custom theme mutes the Windows notification sound and plays onl
   assert.equal(h.soundMessages.some((item) => item.type === 'play-sound' && item.theme === 'glass'), true);
 });
 
+test('failed notification creation remains in the outbox and retries after a worker restart', async () => {
+  const sessionStore = {};
+  const activeNotifications = {};
+  const alarmsStore = {};
+  const localStore = {};
+  const firstWorker = createHarness({ sound: false }, {
+    sessionStore, activeNotifications, alarmsStore, localStore, failedNotificationCreates: 1,
+  });
+  await firstWorker.sendRuntimeMessage(turnStart('retry-after-restart'));
+  const firstAttempt = await firstWorker.sendRuntimeMessage(domCandidate('retry-after-restart'));
+
+  assert.equal(firstAttempt.ok, true);
+  assert.equal(firstAttempt.notificationStatus, 'pending');
+  assert.equal(firstWorker.notifications.length, 1);
+  assert.equal(alarmsStore['turnbell-active-turn-watchdog']?.periodInMinutes, 1);
+  const saved = Object.values(sessionStore.turnbellFinalizationV2)[0];
+  assert.equal(saved.notificationStatus, 'pending');
+  assert.equal(saved.notificationAttempts, 1);
+  assert.ok(saved.notificationRetryAt > 10_000);
+  assert.equal(JSON.stringify(sessionStore).includes('Private conversation title'), false);
+
+  const restartedWorker = createHarness({ sound: false }, {
+    sessionStore, activeNotifications, alarmsStore, localStore, now: saved.notificationRetryAt + 1,
+  });
+  await restartedWorker.sendRuntimeMessage({ type: 'monitor-status' }, {});
+
+  assert.equal(restartedWorker.notifications.length, 1);
+  assert.equal(restartedWorker.notifications[0].id, 'turnbell-42-completion-retry-after-restart');
+  assert.deepEqual(restartedWorker.activeNotificationIds(), ['turnbell-42-completion-retry-after-restart']);
+  assert.equal(Object.values(sessionStore.turnbellFinalizationV2)[0].notificationStatus, 'delivered');
+  assert.equal(Object.hasOwn(alarmsStore, 'turnbell-active-turn-watchdog'), false);
+});
+
+test('a notification created just before worker death is detected without recreating or chiming', async () => {
+  const sessionStore = {};
+  const activeNotifications = {};
+  const firstWorker = createHarness({ sound: false }, { sessionStore, activeNotifications });
+  await firstWorker.sendRuntimeMessage(turnStart('created-before-restart'));
+  await firstWorker.sendRuntimeMessage(domCandidate('created-before-restart'));
+  const notificationId = firstWorker.notifications[0].id;
+  const stored = Object.values(sessionStore.turnbellFinalizationV2)[0];
+  // Recreate the exact crash window: the OS accepted the alert but the status
+  // write that follows it did not reach session storage.
+  stored.notificationStatus = 'pending';
+  stored.notificationAttempts = 1;
+  stored.notificationRetryAt = 0;
+
+  const restartedWorker = createHarness({ sound: false }, {
+    sessionStore, activeNotifications, now: 80_000,
+  });
+  await restartedWorker.sendRuntimeMessage({ type: 'monitor-status' }, {});
+
+  assert.equal(restartedWorker.notifications.length, 0);
+  assert.deepEqual(restartedWorker.activeNotificationIds(), [notificationId]);
+  assert.equal(Object.values(sessionStore.turnbellFinalizationV2)[0].notificationStatus, 'delivered');
+  assert.equal(restartedWorker.soundMessages.some((message) => message.type === 'play-sound'), false);
+});
+
+test('ordinary worker startup restores the active-turn watchdog without startup events', async () => {
+  const sessionStore = {};
+  const alarmsStore = {};
+  const firstWorker = createHarness({ sound: false }, { sessionStore, alarmsStore });
+  await firstWorker.sendRuntimeMessage(turnStart('worker-recovery-turn'));
+  assert.equal(alarmsStore['turnbell-active-turn-watchdog']?.periodInMinutes, 1);
+  delete alarmsStore['turnbell-active-turn-watchdog'];
+
+  const restartedWorker = createHarness({ sound: false }, { sessionStore, alarmsStore });
+  await restartedWorker.sendRuntimeMessage({ type: 'monitor-status' }, {});
+
+  assert.equal(alarmsStore['turnbell-active-turn-watchdog']?.periodInMinutes, 1);
+});
+
+test('watchdog alarms sample active turns on their original tab and route', async () => {
+  const h = createHarness({ sound: false });
+  await h.sendRuntimeMessage(turnStart('watchdog-sample'));
+  h.events.onAlarm.dispatch({ name: 'turnbell-active-turn-watchdog' });
+  await h.flush();
+
+  const sample = h.tabMessages.find((item) => item.message.reason === 'watchdog');
+  assert.equal(sample?.tabId, 42);
+  assert.equal(sample?.message.type, 'monitor-sample-now');
+  assert.equal(sample?.message.pathHash, PATH_A);
+  assert.equal(sample?.message.completionId, 'watchdog-sample');
+  assert.equal(sample?.message.routeEpoch, 1);
+});
+
 test('duplicate evidence is suppressed and a new completion id starts a fresh ledger entry', async () => {
   const h = createHarness({ sound: false });
   await h.sendRuntimeMessage(turnStart());
@@ -383,7 +494,7 @@ test('a switched-away route remains suspended until re-entered with a new epoch'
   assert.equal(h.notifications.length, 1);
 });
 
-test('a locked completion is replayed exactly once after unlock without storing conversation data', async () => {
+test('an active initial locked notification is not repeated after unlock', async () => {
   const h = createHarness({ sound: false }, { idleState: 'locked' });
   await h.sendRuntimeMessage(turnStart('locked-completion'));
   const initial = await h.sendRuntimeMessage(domCandidate('locked-completion', {
@@ -403,14 +514,41 @@ test('a locked completion is replayed exactly once after unlock without storing 
   assert.equal(JSON.stringify(queue).includes('private-conversation'), false);
 
   await h.setIdleState('active');
-  assert.equal(h.notifications.length, 2);
-  assert.equal(h.notifications[1].id, 'turnbell-42-lock-locked-completion-unlock');
-  assert.equal(h.notifications[1].options.message, '锁屏期间有一轮回复完成');
-  assert.deepEqual(h.activeNotificationIds(), ['turnbell-42-lock-locked-completion-unlock']);
-  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'replayed');
+  assert.equal(h.notifications.length, 1);
+  assert.deepEqual(h.activeNotificationIds(), ['turnbell-42-lock-locked-completion-initial']);
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'initial-active');
 
   await h.setIdleState('idle');
+  assert.equal(h.notifications.length, 1);
+});
+
+test('a disappeared locked notification gets one generic replay after unlock', async () => {
+  const h = createHarness({ sound: false }, { idleState: 'locked' });
+  await h.sendRuntimeMessage(turnStart('disappeared-completion'));
+  await h.sendRuntimeMessage(domCandidate('disappeared-completion'));
+  const initialId = h.notifications[0].id;
+  await h.closeNotification(initialId, false);
+
+  await h.setIdleState('active');
   assert.equal(h.notifications.length, 2);
+  assert.equal(h.notifications[1].id, 'turnbell-42-lock-disappeared-completion-unlock');
+  assert.equal(h.notifications[1].options.message, '锁屏期间有一轮回复完成');
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'replayed');
+});
+
+test('an initial notification that disappears after unlock triggers one replay', async () => {
+  const h = createHarness({ sound: false }, { idleState: 'locked' });
+  await h.sendRuntimeMessage(turnStart('late-disappeared-completion'));
+  await h.sendRuntimeMessage(domCandidate('late-disappeared-completion'));
+  const initialId = h.notifications[0].id;
+  await h.setIdleState('active');
+  assert.equal(h.notifications.length, 1);
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'initial-active');
+
+  await h.closeNotification(initialId, false);
+  assert.equal(h.notifications.length, 2);
+  assert.equal(h.notifications[1].id, 'turnbell-42-lock-late-disappeared-completion-unlock');
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'replayed');
 });
 
 test('unlock racing with initial notification creation waits and does not regress queue state', async () => {
@@ -429,12 +567,12 @@ test('unlock racing with initial notification creation waits and does not regres
   assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'creating-initial');
 
   assert.equal(await h.completeNextNotificationCreate(), true);
-  assert.equal(h.notifications.length, 2);
-  assert.equal(await h.completeNextNotificationCreate(), true);
+  assert.equal(h.notifications.length, 1);
+  assert.equal(await h.completeNextNotificationCreate(), false);
   const response = await completion;
   assert.equal(response.ok, true);
-  assert.equal(h.notifications.length, 2);
-  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'replayed');
+  assert.equal(h.notifications.length, 1);
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'initial-active');
 });
 
 test('a user-dismissed locked notification acknowledges the replay record', async () => {
@@ -448,7 +586,21 @@ test('a user-dismissed locked notification acknowledges the replay record', asyn
   assert.equal(h.notifications.length, 1);
 });
 
-test('an orphaned locked notification record is recovered after a service-worker restart', async () => {
+test('Web Notification click waits for locked-replay acknowledgement', async () => {
+  const h = createHarness({ sound: false, notificationBackend: 'web' }, { idleState: 'locked' });
+  await h.sendRuntimeMessage(turnStart('web-clicked-completion'));
+  await h.sendRuntimeMessage(domCandidate('web-clicked-completion'));
+  const webOptions = h.webNotifications[0].options;
+  assert.equal(Object.hasOwn(webOptions.data, 'url'), false);
+
+  await h.dispatchGlobalNotificationEvent('notificationclick', webOptions.data);
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'acknowledged');
+  await h.setIdleState('active');
+  assert.equal(h.webNotifications.length, 1);
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'acknowledged');
+});
+
+test('an orphaned locked notification record recovers on an ordinary worker-start event', async () => {
   const localStore = {
     turnbellLockedReplayQueueV1: [{
       completionId: 'orphaned-completion',
@@ -466,8 +618,7 @@ test('an orphaned locked notification record is recovered after a service-worker
     }],
   };
   const h = createHarness({ sound: false }, { idleState: 'active', localStore });
-  h.events.onStartup.dispatch();
-  await h.flush();
+  await h.sendRuntimeMessage({ type: 'monitor-status' }, {});
   assert.equal(h.notifications.length, 1);
   assert.equal(h.notifications[0].id, 'turnbell-42-lock-orphaned-completion-unlock');
   assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'replayed');
@@ -543,4 +694,5 @@ test('Web Notification compatibility backend bypasses chrome.notifications routi
   assert.equal(response.routes.webPermission, 'granted');
   assert.equal(h.webNotifications.length, 1);
   assert.equal(h.webNotifications[0].options.requireInteraction, true);
+  assert.equal(Object.hasOwn(h.webNotifications[0].options.data, 'url'), false);
 });

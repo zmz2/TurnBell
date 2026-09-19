@@ -23,6 +23,159 @@ function makeTurn(text, identity) {
   return { text, identity, container: { identity } };
 }
 
+async function createContentHarness({
+  pathname = '/c/test',
+  deferInitialRouteEnter = false,
+  routeEnterResponder = null,
+} = {}) {
+  let now = 0;
+  let runtimeListener = null;
+  let observer = null;
+  let deferredRouteEnter = null;
+  const documentListeners = new Map();
+  const globalListeners = new Map();
+  const runtimeMessages = [];
+  const page = { assistantTurns: [], userTurns: [], finalAction: false, generating: false };
+  const location = {
+    origin: 'https://chatgpt.com',
+    pathname,
+    search: '',
+    get href() { return `${this.origin}${this.pathname}${this.search}`; },
+  };
+
+  class FakeDate extends Date { static now() { return now; } }
+  class FakeMutationObserver {
+    constructor(callback) { this.callback = callback; observer = this; }
+    observe() {}
+    disconnect() {}
+  }
+  const ASSISTANT_SELECTORS = Object.freeze(['assistant']);
+  const USER_SELECTORS = Object.freeze(['user']);
+  const FINAL_ACTION_SELECTORS = Object.freeze(['final']);
+  const stopButton = {
+    isConnected: true,
+    hidden: false,
+    disabled: false,
+    getAttribute() { return ''; },
+    getBoundingClientRect() { return { width: 20, height: 20 }; },
+  };
+  const context = {
+    console,
+    URL,
+    Promise,
+    Date: FakeDate,
+    MutationObserver: FakeMutationObserver,
+    location,
+    document: {
+      documentElement: {},
+      title: 'TurnBell lifecycle test - ChatGPT',
+      visibilityState: 'hidden',
+      readyState: 'complete',
+      querySelector(selector) {
+        return page.generating && String(selector).includes('stop') ? stopButton : null;
+      },
+      querySelectorAll() { return []; },
+      addEventListener(type, listener) { documentListeners.set(type, listener); },
+    },
+    getComputedStyle() { return null; },
+    setTimeout() { return 1; },
+    clearTimeout() {},
+    setInterval() { return 1; },
+    queueMicrotask(callback) { Promise.resolve().then(callback); },
+    addEventListener(type, listener) { globalListeners.set(type, listener); },
+    GPTReplyDetector: detectorAPI,
+    GPTReplyNotification: notificationAPI,
+    GPTReplySampleScheduler: {
+      createSampleScheduler() { return { schedule() {}, dispose() {} }; },
+    },
+    TurnBellBootstrap: bootstrapAPI,
+    TurnBellDOMModel: {
+      ASSISTANT_SELECTORS,
+      USER_SELECTORS,
+      FINAL_ACTION_SELECTORS,
+      collectTurns(_document, selectors) {
+        return selectors === USER_SELECTORS ? page.userTurns : page.assistantTurns;
+      },
+      collectAssistantTurns() { return page.assistantTurns; },
+      hasFinalActionForTurn() { return page.finalAction; },
+      fingerprint(value) { return detectorAPI.fingerprint(String(value)); },
+      makeTurnKey({ pathname: pathName, userTurns, assistantCount, cycleNumber }) {
+        const latestUser = userTurns.at(-1)?.identity || 'none';
+        return `dom:${pathName}:${latestUser}:a${assistantCount}:c${cycleNumber}`;
+      },
+    },
+  };
+  context.chrome = {
+    runtime: {
+      id: 'test-extension',
+      lastError: null,
+      sendMessage(message, callback) {
+        runtimeMessages.push(message);
+        if (deferInitialRouteEnter && message.type === 'route-enter' && !deferredRouteEnter) {
+          deferredRouteEnter = callback;
+          return;
+        }
+        const response = message.type === 'route-enter' && routeEnterResponder
+          ? routeEnterResponder(message)
+          : { ok: true, pending: null };
+        callback?.(response);
+      },
+      onMessage: { addListener(listener) { runtimeListener = listener; } },
+    },
+    storage: {
+      sync: { get(defaults, callback) { callback(defaults); } },
+      onChanged: { addListener() {} },
+    },
+  };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(contentSource, context, { filename: 'content.js' });
+  await flushEffects();
+
+  return {
+    context,
+    documentListeners,
+    globalListeners,
+    location,
+    page,
+    runtimeMessages,
+    setNow(value) { now = value; },
+    setPath(value) { location.pathname = value; },
+    resolveInitialRoute(pending) {
+      assert.equal(typeof deferredRouteEnter, 'function');
+      const callback = deferredRouteEnter;
+      deferredRouteEnter = null;
+      callback({ ok: true, pending });
+    },
+    async flush() { await flushEffects(8); },
+    async sampleNow(message = { type: 'monitor-sample-now' }) {
+      const result = await new Promise((resolve) => runtimeListener(message, {}, resolve));
+      await flushEffects(8);
+      return result;
+    },
+    pressEnter() {
+      const composer = {
+        matches(selector) { return selector.includes('textarea'); },
+        closest(selector) {
+          return selector.includes('textarea') || selector.includes('form') || selector.includes('main')
+            ? this
+            : null;
+        },
+      };
+      documentListeners.get('keydown')?.({
+        key: 'Enter', shiftKey: false, ctrlKey: false, altKey: false, metaKey: false,
+        isComposing: false, keyCode: 13, target: composer,
+      });
+    },
+    clickConversationLink(href) {
+      const anchor = { href };
+      documentListeners.get('click')?.({
+        target: { closest(selector) { return selector === 'a[href]' ? anchor : null; } },
+      });
+    },
+  };
+}
+
 test('hydrated history stays silent, then regular and Instant Enter-sent turns each emit one final candidate', async () => {
   let now = 0;
   let runtimeListener = null;
@@ -266,4 +419,136 @@ test('hydrated history stays silent, then regular and Instant Enter-sent turns e
     && message.completionId === switchedCompletionId
     && message.pathHash === candidates[0].pathHash
   )), true);
+});
+
+test('a delayed route-enter response cannot replace a completion created after the handshake', async () => {
+  const h = await createContentHarness({ pathname: '/c/race', deferInitialRouteEnter: true });
+  h.setNow(10_000);
+  h.pressEnter();
+  await h.flush();
+
+  assert.equal(h.runtimeMessages.some((message) => message.type === 'turn-start'), false);
+  h.resolveInitialRoute({
+    completionId: 'stale-route-completion',
+    startedAt: 9_000,
+    baselineUserCount: 0,
+    baselineAssistantCount: 0,
+    startSource: 'implicit',
+    sawGenerating: false,
+  });
+  await h.flush();
+  const firstStart = h.runtimeMessages.find((message) => message.type === 'turn-start');
+  assert.ok(firstStart?.completionId);
+  assert.notEqual(firstStart.completionId, 'stale-route-completion');
+
+  h.setNow(10_100);
+  h.page.userTurns = [makeTurn('new question', 'new-user')];
+  h.page.generating = true;
+  await h.sampleNow();
+  h.setNow(10_300);
+  h.page.assistantTurns = [makeTurn('partial answer', 'new-assistant')];
+  await h.sampleNow();
+  h.setNow(11_000);
+  h.page.assistantTurns = [makeTurn('final answer', 'new-assistant')];
+  h.page.generating = false;
+  h.page.finalAction = true;
+  await h.sampleNow();
+  h.setNow(12_300);
+  await h.sampleNow();
+
+  const candidate = h.runtimeMessages.find((message) => message.type === 'dom-final-candidate');
+  assert.equal(candidate?.completionId, firstStart.completionId);
+  assert.equal(candidate?.completionId === 'stale-route-completion', false);
+});
+
+test('a placeholder turn moves to its generated conversation route after the first cycle', async () => {
+  const h = await createContentHarness({ pathname: '/' });
+  h.setNow(2_000);
+  h.pressEnter();
+  h.setNow(2_100);
+  h.page.userTurns = [makeTurn('new question', 'placeholder-user')];
+  h.page.generating = true;
+  await h.sampleNow();
+  await h.flush();
+
+  const original = h.runtimeMessages.find((message) => message.type === 'turn-start');
+  assert.ok(original?.completionId);
+  h.setPath('/c/generated-conversation');
+  await h.sampleNow();
+  await h.flush();
+
+  const move = h.runtimeMessages.find((message) => message.type === 'turn-move');
+  assert.equal(move?.completionId, original.completionId);
+  assert.equal(h.runtimeMessages.some((message) => (
+    message.type === 'turn-suspend' && message.completionId === original.completionId
+  )), false);
+});
+
+test('clicking an existing conversation from the placeholder is not mistaken for a new-turn route move', async () => {
+  const h = await createContentHarness({ pathname: '/' });
+  h.setNow(3_000);
+  h.pressEnter();
+  h.setNow(3_100);
+  h.page.userTurns = [makeTurn('new question', 'placeholder-user')];
+  h.page.generating = true;
+  await h.sampleNow();
+  await h.flush();
+  const original = h.runtimeMessages.find((message) => message.type === 'turn-start');
+  assert.ok(original?.completionId);
+
+  h.clickConversationLink('https://chatgpt.com/c/existing-conversation');
+  h.setPath('/c/existing-conversation');
+  await h.sampleNow();
+  await h.flush();
+
+  assert.equal(h.runtimeMessages.some((message) => message.type === 'turn-move'), false);
+  assert.equal(h.runtimeMessages.some((message) => (
+    message.type === 'turn-suspend' && message.completionId === original.completionId
+  )), true);
+});
+
+test('route recovery accepts a changed same-count retry reply after stable final evidence', async () => {
+  let routeEnterCount = 0;
+  const pending = {
+    completionId: 'same-count-retry',
+    startedAt: 1_000,
+    baselineUserCount: 1,
+    baselineAssistantCount: 1,
+    startSource: 'explicit',
+    sawGenerating: false,
+  };
+  const h = await createContentHarness({
+    pathname: '/c/a',
+    routeEnterResponder() {
+      routeEnterCount += 1;
+      return { ok: true, pending: routeEnterCount === 2 ? null : pending };
+    },
+  });
+  h.page.userTurns = [makeTurn('retry question', 'user-a')];
+  h.page.assistantTurns = [makeTurn('previous answer', 'assistant-a')];
+  h.page.finalAction = true;
+  h.setNow(5_000);
+  await h.sampleNow();
+  await h.flush();
+
+  h.setNow(6_000);
+  h.setPath('/c/b');
+  await h.sampleNow();
+  await h.flush();
+  h.setNow(7_000);
+  h.setPath('/c/a');
+  h.page.assistantTurns = [makeTurn('regenerated answer', 'assistant-a')];
+  h.page.finalAction = true;
+  await h.sampleNow();
+  await h.flush();
+
+  h.setNow(9_001);
+  await h.sampleNow();
+  h.setNow(10_201);
+  await h.sampleNow();
+
+  const candidate = h.runtimeMessages.find((message) => message.type === 'dom-final-candidate');
+  assert.equal(candidate?.completionId, 'same-count-retry');
+  assert.equal(candidate?.payload.event.finalEvidence, 'final-action');
+  assert.equal(routeEnterCount, 3);
 });

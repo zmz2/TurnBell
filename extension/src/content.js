@@ -74,9 +74,12 @@
   let currentPath = routePath();
   let routeEpoch = 1;
   let currentCompletionId = '';
+  let completionGeneration = 0;
   let currentCompletionStartedAt = 0;
   let lastReportedGeneratingCompletionId = '';
   let pendingRouteRecovery = null;
+  let placeholderMigration = null;
+  let recentExplicitRouteNavigationAt = 0;
   let recoveryLastFingerprint = '';
   let recoveryStableSince = 0;
   let recoveryStableSamples = 0;
@@ -90,6 +93,7 @@
   let lastReportedSampleSignature = '';
   let lastReportedRevisionBucket = 0;
   const routeHashCache = new Map();
+  const recoveryBaselineFingerprints = new Map();
 
   function routePath() {
     return `${String(location.pathname || '/')}${String(location.search || '')}`;
@@ -98,6 +102,11 @@
   function isNewConversationPlaceholder(path) {
     const pathname = String(path || '/').split('?', 1)[0].replace(/\/$/u, '') || '/';
     return pathname === '/' || pathname === '/new' || pathname === '/c/new';
+  }
+
+  function isConversationRoute(path) {
+    const pathname = String(path || '/').split('?', 1)[0];
+    return /^\/c\/[^/]+$/u.test(pathname) && !isNewConversationPlaceholder(pathname);
   }
 
   function fallbackRouteHash(value) {
@@ -290,13 +299,18 @@
   function enterCurrentRoute({ fromPathHash = '', completionId = '' } = {}) {
     const path = currentPath;
     const epoch = routeEpoch;
+    const expectedCompletionGeneration = completionGeneration;
     void sendRouteMessage({
       type: fromPathHash && completionId ? 'turn-move' : 'route-enter',
       fromPathHash,
       completionId,
       at: Date.now(),
     }, path, epoch, (response) => {
-      if (path !== routePath() || epoch !== routeEpoch) return;
+      if (
+        path !== routePath()
+        || epoch !== routeEpoch
+        || expectedCompletionGeneration !== completionGeneration
+      ) return;
       const pending = response?.pending && typeof response.pending === 'object'
         ? response.pending
         : null;
@@ -305,7 +319,9 @@
       recoveryStableSince = 0;
       recoveryStableSamples = 0;
       if (pending) {
-        currentCompletionId = String(pending.completionId || '');
+        const pendingCompletionId = String(pending.completionId || '');
+        if (pendingCompletionId !== currentCompletionId) completionGeneration += 1;
+        currentCompletionId = pendingCompletionId;
         currentCompletionStartedAt = Number(pending.startedAt) || 0;
       }
       scheduleSample(0);
@@ -339,12 +355,21 @@
     if (key !== lastSentTurnKey || !currentCompletionId) {
       lastSentTurnKey = key;
       currentCompletionId = createCompletionId();
+      completionGeneration += 1;
       currentCompletionStartedAt = Number(pendingIntent?.at) || Number(snapshot?.now) || Date.now();
       lastReportedGeneratingCompletionId = '';
       pendingRouteRecovery = null;
       recoveryLastFingerprint = '';
       recoveryStableSince = 0;
       recoveryStableSamples = 0;
+      if (source === 'explicit' && isNewConversationPlaceholder(currentPath)) {
+        placeholderMigration = {
+          completionId: currentCompletionId,
+          expiresAt: Date.now() + 30_000,
+        };
+      } else {
+        placeholderMigration = null;
+      }
     }
     sendRouteMessage({
       type: 'turn-start',
@@ -352,6 +377,7 @@
       startedAt: currentCompletionStartedAt,
       userCount: Number(snapshot?.userCount) || 0,
       assistantCount: Number(snapshot?.assistantCount) || 0,
+      tabHidden: document.visibilityState !== 'visible',
       source: source === 'explicit' ? 'explicit' : 'implicit',
       at: Date.now(),
     });
@@ -412,8 +438,15 @@
         context: pageContext(snapshot),
       },
     }, currentPath, routeEpoch, (response) => {
-      if (response?.ok && (response.suppressed === true || response.routes)) {
+      const terminalSuppression = response?.suppressed === true
+        && ['already-notified', 'settings', 'expired-turn'].includes(String(response.reason || ''));
+      const durablyHandled = ['pending', 'delivered', 'suppressed'].includes(
+        String(response?.notificationStatus || ''),
+      );
+      if (response?.ok && (terminalSuppression || durablyHandled)) {
         pendingRouteRecovery = null;
+        recoveryBaselineFingerprints.delete(String(completionId || ''));
+        if (placeholderMigration?.completionId === completionId) placeholderMigration = null;
       }
     });
   }
@@ -470,7 +503,23 @@
     const oldEpoch = routeEpoch;
     const now = Date.now();
     const state = detector.getState?.() || { phase: 'idle' };
-    const pendingIsFresh = pendingIntent && now - pendingIntent.at <= INTENT_COALESCE_MS;
+    const recoveryWasPending = pendingRouteRecovery?.completionId === currentCompletionId;
+    if (currentCompletionId && lastObservedFingerprint) {
+      recoveryBaselineFingerprints.set(currentCompletionId, lastObservedFingerprint);
+      while (recoveryBaselineFingerprints.size > 12) {
+        recoveryBaselineFingerprints.delete(recoveryBaselineFingerprints.keys().next().value);
+      }
+    }
+    const migration = placeholderMigration;
+    const recentlyClickedConversationLink = now - recentExplicitRouteNavigationAt < 1_500;
+    const canAdoptPlaceholderTurn = Boolean(
+      migration
+      && migration.completionId === currentCompletionId
+      && migration.expiresAt >= now
+      && isNewConversationPlaceholder(oldPath)
+      && isConversationRoute(nextPath)
+      && !recentlyClickedConversationLink
+    );
     currentPath = nextPath;
     routeEpoch += 1;
     lastSettleKey = '';
@@ -479,14 +528,18 @@
     recoveryStableSince = 0;
     recoveryStableSamples = 0;
 
-    // A placeholder URL can become a real conversation after the first send.
-    // Existing conversation routes changing within the intent window are treated
-    // as task switches and must keep their completion attached to the old route.
-    if (pendingIsFresh && currentCompletionId && isNewConversationPlaceholder(oldPath)) {
+    // A new conversation can be assigned its /c/<id> URL after the first DOM
+    // cycle, after the transient send intent has already been consumed.
+    if (canAdoptPlaceholderTurn) {
       const newEpoch = routeEpoch;
+      const migratingCompletionId = currentCompletionId;
       void routeHash(oldPath).then((fromPathHash) => {
-        if (nextPath !== routePath() || newEpoch !== routeEpoch) return;
-        enterCurrentRoute({ fromPathHash, completionId: currentCompletionId });
+        if (
+          nextPath !== routePath()
+          || newEpoch !== routeEpoch
+          || migratingCompletionId !== currentCompletionId
+        ) return;
+        enterCurrentRoute({ fromPathHash, completionId: migratingCompletionId });
         const snapshot = snapshotForCycle(state.cycleNumber);
         announceTurn(currentTurnKey, snapshot, 'explicit');
       });
@@ -494,15 +547,17 @@
       return false;
     }
 
-    if (state.phase !== 'idle' && currentCompletionId) {
+    if ((state.phase !== 'idle' || recoveryWasPending) && currentCompletionId) {
       sendRouteMessage({ type: 'turn-suspend', completionId: currentCompletionId, at: now }, oldPath, oldEpoch, null, true);
     }
+    placeholderMigration = null;
     detector.reset();
     bootstrapGate.reset(now);
     currentTurnKey = '';
     lastSentTurnKey = '';
     lastDetectorCycle = 0;
     pendingIntent = null;
+    completionGeneration += 1;
     currentCompletionId = '';
     currentCompletionStartedAt = 0;
     lastReportedGeneratingCompletionId = '';
@@ -532,7 +587,24 @@
 
     const baselineAssistantCount = Math.max(0, Number(pending.baselineAssistantCount) || 0);
     const baselineUserCount = Math.max(0, Number(pending.baselineUserCount) || 0);
-    if (snapshot.userCount < baselineUserCount || snapshot.assistantCount <= baselineAssistantCount) {
+    const baselineFingerprint = recoveryBaselineFingerprints.get(pending.completionId) || '';
+    const sameCountFingerprintChanged = Boolean(
+      snapshot.assistantCount === baselineAssistantCount
+      && baselineFingerprint
+      && snapshot.fingerprint
+      && snapshot.fingerprint !== baselineFingerprint
+    );
+    const sameCountGenerationSeen = (
+      snapshot.assistantCount === baselineAssistantCount
+      && pending.sawGenerating === true
+    );
+    if (
+      snapshot.userCount < baselineUserCount
+      || snapshot.assistantCount < baselineAssistantCount
+      || (snapshot.assistantCount === baselineAssistantCount
+        && !sameCountFingerprintChanged
+        && !sameCountGenerationSeen)
+    ) {
       recoveryLastFingerprint = '';
       recoveryStableSince = 0;
       recoveryStableSamples = 0;
@@ -762,6 +834,15 @@
       noteUserIntent('enter');
     }, true);
     document.addEventListener('click', (event) => {
+      try {
+        const anchor = event?.target?.closest?.('a[href]');
+        if (anchor) {
+          const destination = new URL(String(anchor.href || ''), location.href);
+          if (destination.origin === location.origin && isConversationRoute(destination.pathname)) {
+            recentExplicitRouteNavigationAt = Date.now();
+          }
+        }
+      } catch { /* ignore malformed or synthetic link targets */ }
       const target = event?.target?.closest?.(USER_INTENT_SELECTOR);
       if (target) noteUserIntent('button');
     }, true);
@@ -773,7 +854,10 @@
     globalThis.addEventListener?.('pagehide', (event) => {
       reportLifecycle('pagehide', { persisted: event?.persisted === true });
     });
-    globalThis.addEventListener?.('popstate', () => scheduleSample(0));
+    globalThis.addEventListener?.('popstate', () => {
+      recentExplicitRouteNavigationAt = Date.now();
+      scheduleSample(0);
+    });
     globalThis.addEventListener?.('focus', () => {
       reportLifecycle('focus');
       lastSettleKey = '';
@@ -786,7 +870,7 @@
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     switch (message?.type) {
       case 'monitor-ping':
-        sendResponse({ ok: true, active: true, version: '1.5.0', mode: 'dom-only' });
+        sendResponse({ ok: true, active: true, version: '1.5.1', mode: 'dom-only' });
         return false;
       case 'monitor-sample-now': {
         const expectedPathHash = String(message.pathHash || '');

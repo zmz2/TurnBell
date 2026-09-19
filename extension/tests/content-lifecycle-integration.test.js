@@ -27,11 +27,13 @@ async function createContentHarness({
   pathname = '/c/test',
   deferInitialRouteEnter = false,
   routeEnterResponder = null,
+  failedCandidateResponses = 0,
 } = {}) {
   let now = 0;
   let runtimeListener = null;
   let observer = null;
   let deferredRouteEnter = null;
+  let remainingFailedCandidateResponses = Math.max(0, Number(failedCandidateResponses) || 0);
   const documentListeners = new Map();
   const globalListeners = new Map();
   const runtimeMessages = [];
@@ -117,7 +119,23 @@ async function createContentHarness({
         }
         const response = message.type === 'route-enter' && routeEnterResponder
           ? routeEnterResponder(message)
-          : { ok: true, pending: null };
+          : (message.type === 'turn-move'
+            ? {
+              ok: true,
+              pending: {
+                completionId: message.completionId,
+                startedAt: 2_000,
+                baselineUserCount: 0,
+                baselineAssistantCount: 0,
+                startSource: 'explicit',
+                sawGenerating: false,
+              },
+            }
+            : (message.type === 'dom-final-candidate' && remainingFailedCandidateResponses > 0
+              ? (remainingFailedCandidateResponses -= 1, { ok: false, error: 'temporary-storage-error' })
+              : (message.type === 'dom-final-candidate'
+                ? { ok: true, notificationStatus: 'delivered' }
+                : { ok: true, pending: null })));
         callback?.(response);
       },
       onMessage: { addListener(listener) { runtimeListener = listener; } },
@@ -172,6 +190,9 @@ async function createContentHarness({
       documentListeners.get('click')?.({
         target: { closest(selector) { return selector === 'a[href]' ? anchor : null; } },
       });
+    },
+    setFailedCandidateResponses(value) {
+      remainingFailedCandidateResponses = Math.max(0, Number(value) || 0);
     },
   };
 }
@@ -268,7 +289,9 @@ test('hydrated history stays silent, then regular and Instant Enter-sent turns e
       lastError: null,
       sendMessage(message, callback) {
         runtimeMessages.push(message);
-        callback?.({ ok: true });
+        callback?.(message.type === 'dom-final-candidate'
+          ? { ok: true, notificationStatus: 'delivered' }
+          : { ok: true });
       },
       onMessage: { addListener(listener) { runtimeListener = listener; } },
     },
@@ -461,7 +484,7 @@ test('a delayed route-enter response cannot replace a completion created after t
   assert.equal(candidate?.completionId === 'stale-route-completion', false);
 });
 
-test('a placeholder route assignment suspends the old route and starts generation under the destination', async () => {
+test('a placeholder route assignment migrates the explicitly submitted turn with its shared user node', async () => {
   const h = await createContentHarness({ pathname: '/' });
   h.setNow(2_000);
   h.pressEnter();
@@ -480,18 +503,15 @@ test('a placeholder route assignment suspends the old route and starts generatio
   await h.sampleNow();
   await h.flush();
 
-  const destinationStart = h.runtimeMessages.find((message) => (
-    message.type === 'turn-start'
-    && message.completionId !== original.completionId
-    && message.pathHash !== original.pathHash
-  ));
-  assert.ok(destinationStart?.completionId);
+  const migration = h.runtimeMessages.find((message) => message.type === 'turn-move');
+  assert.equal(migration?.completionId, original.completionId);
+  assert.equal(migration?.routeMoveEvidence, 'shared-user-turn-node');
   assert.equal(h.runtimeMessages.some((message) => (
     message.type === 'turn-suspend'
     && message.completionId === original.completionId
     && message.pathHash === original.pathHash
   )), true);
-  assert.equal(h.runtimeMessages.some((message) => message.type === 'turn-move'), false);
+  assert.equal(h.runtimeMessages.filter((message) => message.type === 'turn-move').length, 1);
 });
 
 test('a programmatic switch to an existing conversation never adopts the placeholder completion', async () => {
@@ -715,4 +735,253 @@ test('route recovery does not reuse an old final action after same-count regener
     message.type === 'dom-final-candidate' && message.completionId === 'same-count-unchanged'
   )), false);
   assert.equal(routeEnterCount, 3);
+});
+
+test('same-count route recovery trusts persisted evidence that generation replaced the old final action', async () => {
+  let routeEnterCount = 0;
+  const pending = {
+    completionId: 'same-count-with-live-generation',
+    startedAt: 1_000,
+    baselineUserCount: 1,
+    baselineAssistantCount: 1,
+    startSource: 'explicit',
+    sawGenerating: true,
+    sawGeneratingWithoutFinalAction: true,
+  };
+  const h = await createContentHarness({
+    pathname: '/c/a',
+    routeEnterResponder() {
+      routeEnterCount += 1;
+      return { ok: true, pending: routeEnterCount === 1 || routeEnterCount === 3 ? pending : null };
+    },
+  });
+  h.page.userTurns = [makeTurn('question', 'user-a')];
+  h.page.assistantTurns = [makeTurn('same final answer', 'assistant-a')];
+  h.page.finalAction = true;
+  h.setNow(5_000);
+  await h.sampleNow();
+  await h.flush();
+  assert.equal(h.runtimeMessages.some((message) => message.type === 'dom-final-candidate'), false);
+
+  h.setNow(6_000);
+  h.setPath('/c/b');
+  await h.sampleNow();
+  await h.flush();
+  h.setNow(7_000);
+  h.setPath('/c/a');
+  await h.sampleNow();
+  await h.flush();
+  h.setNow(9_001);
+  await h.sampleNow();
+  h.setNow(10_201);
+  await h.sampleNow();
+
+  const candidate = h.runtimeMessages.find((message) => message.type === 'dom-final-candidate');
+  assert.equal(candidate?.completionId, pending.completionId);
+  assert.equal(routeEnterCount, 3);
+});
+
+test('a changed no-action answer breaks route-recovery stability before an old answer returns', async () => {
+  let routeEnterCount = 0;
+  const pending = {
+    completionId: 'recovery-stability-reset',
+    startedAt: 1_000,
+    baselineUserCount: 1,
+    baselineAssistantCount: 0,
+    startSource: 'explicit',
+    sawGenerating: true,
+  };
+  const h = await createContentHarness({
+    pathname: '/c/a',
+    routeEnterResponder() {
+      routeEnterCount += 1;
+      return { ok: true, pending: routeEnterCount === 3 ? pending : null };
+    },
+  });
+  h.page.userTurns = [makeTurn('question', 'user-a')];
+  h.page.assistantTurns = [makeTurn('answer X', 'assistant-a')];
+  h.page.finalAction = true;
+  h.setNow(5_000);
+  await h.sampleNow();
+  await h.flush();
+
+  h.setNow(5_100);
+  h.setPath('/c/b');
+  await h.sampleNow();
+  await h.flush();
+  h.setNow(7_100);
+  h.page.assistantTurns = [makeTurn('answer Y', 'assistant-a')];
+  h.page.finalAction = false;
+  h.setPath('/c/a');
+  await h.sampleNow();
+  await h.flush();
+  await h.sampleNow();
+  h.setNow(9_101);
+  await h.sampleNow();
+  assert.equal(h.runtimeMessages.some((message) => message.type === 'dom-final-candidate'), false);
+
+  h.setNow(9_301);
+  h.page.assistantTurns = [makeTurn('answer X', 'assistant-a')];
+  h.page.finalAction = true;
+  await h.sampleNow();
+  h.setNow(10_401);
+  await h.sampleNow();
+  assert.equal(h.runtimeMessages.some((message) => message.type === 'dom-final-candidate'), false);
+  h.setNow(10_501);
+  await h.sampleNow();
+
+  assert.equal(h.runtimeMessages.some((message) => (
+    message.type === 'dom-final-candidate' && message.completionId === pending.completionId
+  )), true);
+  assert.equal(routeEnterCount, 3);
+});
+
+test('a source conversation stop control cannot start a turn on a new route while its DOM is still mounted', async () => {
+  const h = await createContentHarness({ pathname: '/c/source' });
+  h.setNow(1_000);
+  h.pressEnter();
+  h.setNow(1_100);
+  h.page.userTurns = [makeTurn('source question', 'source-user')];
+  h.page.assistantTurns = [makeTurn('partial source answer', 'source-assistant')];
+  h.page.generating = true;
+  await h.sampleNow();
+  await h.flush();
+  const sourceStart = h.runtimeMessages.find((message) => message.type === 'turn-start');
+  assert.ok(sourceStart?.completionId);
+
+  h.setNow(1_500);
+  h.setPath('/c/destination');
+  await h.sampleNow();
+  await h.flush();
+  h.setNow(2_000);
+  await h.sampleNow();
+  assert.equal(new Set(h.runtimeMessages
+    .filter((message) => message.type === 'turn-start')
+    .map((message) => message.completionId)).size, 1);
+  assert.equal(h.runtimeMessages.some((message) => message.type === 'dom-final-candidate'), false);
+
+  h.page.userTurns = [makeTurn('destination history', 'destination-user')];
+  h.page.assistantTurns = [makeTurn('destination history answer', 'destination-assistant')];
+  h.page.generating = false;
+  h.page.finalAction = true;
+  h.setNow(4_000);
+  await h.sampleNow();
+  h.setNow(4_101);
+  await h.sampleNow();
+  assert.equal(new Set(h.runtimeMessages
+    .filter((message) => message.type === 'turn-start')
+    .map((message) => message.completionId)).size, 1);
+
+  h.setNow(4_200);
+  h.pressEnter();
+  h.setNow(4_300);
+  h.page.userTurns = [...h.page.userTurns, makeTurn('destination live question', 'destination-live-user')];
+  h.page.generating = true;
+  h.page.finalAction = false;
+  await h.sampleNow();
+  assert.equal(new Set(h.runtimeMessages
+    .filter((message) => message.type === 'turn-start')
+    .map((message) => message.completionId)).size, 2);
+});
+
+test('a stale route document claim keeps its DOM silent after the background rejects it', async () => {
+  const h = await createContentHarness({
+    pathname: '/c/stale-document',
+    routeEnterResponder() {
+      return { ok: true, pending: null, reason: 'stale-document-claim' };
+    },
+  });
+  h.setNow(1_000);
+  h.page.userTurns = [makeTurn('old route question', 'old-route-user')];
+  h.page.assistantTurns = [makeTurn('old route answer', 'old-route-assistant')];
+  h.page.generating = true;
+  await h.sampleNow();
+  await h.flush();
+
+  assert.equal(h.runtimeMessages.some((message) => message.type === 'turn-start'), false);
+  assert.equal(h.runtimeMessages.some((message) => message.type === 'dom-final-candidate'), false);
+});
+
+test('a failed first candidate handoff is retried with its original completion id', async () => {
+  const h = await createContentHarness({ pathname: '/c/retry-candidate', failedCandidateResponses: 1 });
+  h.setNow(1_000);
+  h.pressEnter();
+  h.setNow(1_100);
+  h.page.userTurns = [makeTurn('retry question', 'retry-user')];
+  h.page.generating = true;
+  await h.sampleNow();
+  h.setNow(1_300);
+  h.page.assistantTurns = [makeTurn('partial answer', 'retry-assistant')];
+  await h.sampleNow();
+  h.setNow(2_000);
+  h.page.assistantTurns = [makeTurn('final answer', 'retry-assistant')];
+  h.page.generating = false;
+  h.page.finalAction = true;
+  await h.sampleNow();
+  h.setNow(3_201);
+  await h.sampleNow();
+  await h.flush();
+
+  const first = h.runtimeMessages.filter((message) => message.type === 'dom-final-candidate');
+  assert.equal(first.length, 1);
+  const completionId = first[0].completionId;
+  h.setNow(4_701);
+  await h.sampleNow();
+  await h.flush();
+
+  const retries = h.runtimeMessages.filter((message) => message.type === 'dom-final-candidate');
+  assert.equal(retries.length, 2);
+  assert.equal(retries[1].completionId, completionId);
+  assert.equal(new Set(h.runtimeMessages
+    .filter((message) => message.type === 'turn-start')
+    .map((message) => message.completionId)).size, 1);
+});
+
+test('placeholder Instant replies migrate when the submitted user node survives URL assignment', async () => {
+  const h = await createContentHarness({ pathname: '/' });
+  h.setNow(1_000);
+  h.pressEnter();
+  h.setNow(1_100);
+  h.page.userTurns = [makeTurn('instant question', 'instant-user')];
+  h.page.assistantTurns = [makeTurn('instant answer', 'instant-assistant')];
+  h.page.generating = false;
+  h.page.finalAction = false;
+  await h.sampleNow();
+  await h.flush();
+  const sourceStart = h.runtimeMessages.find((message) => message.type === 'turn-start');
+  assert.ok(sourceStart?.completionId);
+
+  h.setNow(1_300);
+  h.setPath('/c/generated-instant');
+  await h.sampleNow();
+  await h.flush();
+  const migration = h.runtimeMessages.find((message) => message.type === 'turn-move');
+  assert.equal(migration?.completionId, sourceStart.completionId);
+
+  h.setNow(1_400);
+  await h.sampleNow();
+  h.setNow(7_401);
+  await h.sampleNow();
+  h.setNow(10_401);
+  await h.sampleNow();
+  const candidate = h.runtimeMessages.find((message) => message.type === 'dom-final-candidate');
+  assert.equal(candidate?.completionId, sourceStart.completionId);
+  assert.equal(candidate?.payload.event.finalEvidence, 'explicit-fast-stable');
+});
+
+test('placeholder turns do not migrate when a conversation link was clicked', async () => {
+  const h = await createContentHarness({ pathname: '/' });
+  h.setNow(1_000);
+  h.pressEnter();
+  h.setNow(1_100);
+  h.page.userTurns = [makeTurn('instant question', 'instant-user')];
+  h.page.generating = true;
+  await h.sampleNow();
+  await h.flush();
+  h.setNow(1_200);
+  h.clickConversationLink('https://chatgpt.com/c/existing');
+  h.setPath('/c/existing');
+  await h.sampleNow();
+  await h.flush();
+  assert.equal(h.runtimeMessages.some((message) => message.type === 'turn-move'), false);
 });

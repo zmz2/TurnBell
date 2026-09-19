@@ -30,6 +30,7 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
   const localStore = environmentOverrides.localStore || {};
   const alarmsStore = environmentOverrides.alarmsStore || {};
   const badgeCalls = [];
+  let alarmCreateCount = 0;
   const soundMessages = [];
   const tabMessages = [];
   const createdTabs = [];
@@ -54,7 +55,10 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
   let failedNotificationQueries = Math.max(0, Number(environmentOverrides.failedNotificationQueries) || 0);
   let failedWebNotificationQueries = Math.max(0, Number(environmentOverrides.failedWebNotificationQueries) || 0);
   let failedSessionWrites = Math.max(0, Number(environmentOverrides.failedSessionWrites) || 0);
+  let failedSessionReads = Math.max(0, Number(environmentOverrides.failedSessionReads) || 0);
+  let failedLocalReads = Math.max(0, Number(environmentOverrides.failedLocalReads) || 0);
   let closeDuringNextGetAll = '';
+  let deferNotificationCreate = environmentOverrides.deferNotificationCreate === true;
   const tabActive = environmentOverrides.tabActive ?? false;
   const windowFocused = environmentOverrides.windowFocused ?? true;
   let idleState = environmentOverrides.idleState || 'active';
@@ -83,6 +87,13 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
       },
       session: {
         get(defaults, callback) {
+          if (failedSessionReads > 0) {
+            failedSessionReads -= 1;
+            runtime.lastError = { message: 'test-session-read-failed' };
+            callback({});
+            runtime.lastError = null;
+            return;
+          }
           const result = {};
           for (const [key, fallback] of Object.entries(defaults || {})) {
             result[key] = Object.hasOwn(sessionStore, key) ? sessionStore[key] : fallback;
@@ -107,6 +118,13 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
       },
       local: {
         get(defaults, callback) {
+          if (failedLocalReads > 0) {
+            failedLocalReads -= 1;
+            runtime.lastError = { message: 'test-local-read-failed' };
+            callback({});
+            runtime.lastError = null;
+            return;
+          }
           const result = {};
           for (const [key, fallback] of Object.entries(defaults || {})) {
             result[key] = Object.hasOwn(localStore, key) ? localStore[key] : fallback;
@@ -135,7 +153,7 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
           activeNotifications[id] = options;
           callback(id);
         };
-        if (environmentOverrides.deferNotificationCreate === true) {
+        if (deferNotificationCreate) {
           deferredNotificationCreates.push(finish);
         } else {
           finish();
@@ -190,8 +208,16 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
     webRequest: { onBeforeRequest: events.onBeforeRequest, onCompleted: events.onCompleted, onErrorOccurred: events.onErrorOccurred },
     alarms: {
       onAlarm: events.onAlarm,
-      create(name, info) { alarmsStore[name] = { name, ...info }; },
+      create(name, info) {
+        alarmCreateCount += 1;
+        alarmsStore[name] = {
+          name,
+          ...info,
+          scheduledTime: clock + Number(info.delayInMinutes || 0) * 60_000,
+        };
+      },
       clear(name) { const existed = Boolean(alarmsStore[name]); delete alarmsStore[name]; return Promise.resolve(existed); },
+      get(name, callback) { callback(alarmsStore[name] ? { ...alarmsStore[name] } : undefined); },
       getAll(callback) { callback(Object.values(alarmsStore)); },
     },
     idle: {
@@ -251,11 +277,15 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
       return true;
     },
     alarmsStore, badgeCalls, createdTabs, events, localStore, notifications, sessionStore, soundMessages, tabMessages, webNotifications,
+    get alarmCreateCount() { return alarmCreateCount; },
     setClock(value) { clock = value; },
     setFailedNotificationCreates(value) { failedNotificationCreates = Math.max(0, Number(value) || 0); },
     setFailedNotificationQueries(value) { failedNotificationQueries = Math.max(0, Number(value) || 0); },
     setFailedWebNotificationQueries(value) { failedWebNotificationQueries = Math.max(0, Number(value) || 0); },
     setFailedSessionWrites(value) { failedSessionWrites = Math.max(0, Number(value) || 0); },
+    setFailedSessionReads(value) { failedSessionReads = Math.max(0, Number(value) || 0); },
+    setFailedLocalReads(value) { failedLocalReads = Math.max(0, Number(value) || 0); },
+    setDeferNotificationCreate(value) { deferNotificationCreate = value === true; },
     closeOnNextGetAll(id) { closeDuringNextGetAll = String(id || ''); },
     async setIdleState(value) {
       idleState = value;
@@ -595,6 +625,132 @@ test('a notification created just before worker death is detected without recrea
   assert.equal(restartedWorker.soundMessages.some((message) => message.type === 'play-sound'), false);
 });
 
+test('an extension notification query error defers creation instead of replacing an unknown active alert', async () => {
+  const h = createHarness({ sound: false }, { failedNotificationQueries: 1 });
+  await h.sendRuntimeMessage(turnStart('unverified-active-query'));
+  const firstAttempt = await h.sendRuntimeMessage(domCandidate('unverified-active-query'));
+
+  assert.equal(firstAttempt.notificationStatus, 'pending');
+  assert.equal(h.notifications.length, 0);
+  assert.equal(Object.values(h.sessionStore.turnbellFinalizationV2)[0].notificationStatus, 'pending');
+
+  h.setClock(80_000);
+  h.events.onAlarm.dispatch({ name: 'turnbell-active-turn-watchdog' });
+  await h.flush();
+  assert.equal(h.notifications.length, 1);
+  assert.equal(h.activeNotificationIds().length, 1);
+});
+
+test('a failed finalization read never replaces the persisted ledger with an empty store', async () => {
+  const sessionStore = {};
+  const firstWorker = createHarness({ sound: false }, { sessionStore });
+  await firstWorker.sendRuntimeMessage(turnStart('preserve-after-read-error'));
+  const savedBefore = JSON.stringify(sessionStore.turnbellFinalizationV2);
+
+  const restartedWorker = createHarness({ sound: false }, { sessionStore, failedSessionReads: 1 });
+  const status = await restartedWorker.sendRuntimeMessage({ type: 'monitor-status' }, {});
+  assert.equal(status.ok, true);
+  assert.equal(JSON.stringify(sessionStore.turnbellFinalizationV2), savedBefore);
+
+  const routed = await restartedWorker.sendRuntimeMessage({
+    type: 'route-enter', pathHash: PATH_A, routeEpoch: 2, at: 11_000,
+  });
+  assert.equal(routed.pending?.completionId, 'preserve-after-read-error');
+});
+
+test('a failed lock replay read never writes a partial empty queue', async () => {
+  const originalQueue = [{
+    completionId: 'preserve-lock-entry',
+    tabId: 42,
+    completedAt: 10_000,
+    durationMs: 1_000,
+    initialNotificationId: 'turnbell-42-lock-preserve-lock-entry-initial',
+    replayNotificationId: 'turnbell-42-lock-preserve-lock-entry-unlock',
+    initialWebTag: 'turnbell-web-preserve-lock-entry-initial',
+    replayWebTag: 'turnbell-web-preserve-lock-entry-unlock',
+    status: 'pending',
+    initialAttemptAt: 1,
+    attempts: 0,
+    expiresAt: 90_000_000,
+    tabClosed: false,
+    initialClosed: false,
+  }];
+  const localStore = { turnbellLockedReplayQueueV1: originalQueue.map((entry) => ({ ...entry })) };
+  const worker = createHarness({ sound: false }, { localStore, failedLocalReads: 1 });
+  await worker.sendRuntimeMessage({ type: 'monitor-status' }, {});
+
+  assert.deepEqual(localStore.turnbellLockedReplayQueueV1, originalQueue);
+});
+
+test('frequent route updates keep the existing watchdog due time instead of starving retries', async () => {
+  const h = createHarness({ sound: false });
+  await h.sendRuntimeMessage(turnStart('alarm-not-starved'));
+  const originalAlarm = { ...h.alarmsStore['turnbell-active-turn-watchdog'] };
+  const originalCreateCount = h.alarmCreateCount;
+
+  for (let index = 0; index < 5; index += 1) {
+    await h.sendRuntimeMessage({
+      type: 'route-enter', pathHash: PATH_A, routeEpoch: 1, at: 10_100 + index * 20_000,
+    });
+  }
+
+  assert.equal(h.alarmCreateCount, originalCreateCount);
+  assert.equal(h.alarmsStore['turnbell-active-turn-watchdog'].scheduledTime, originalAlarm.scheduledTime);
+});
+
+test('a newer route document owns the pending completion when an older active snapshot arrives late', async () => {
+  const h = createHarness({ sound: false });
+  await h.sendRuntimeMessage(turnStart('document-claim-race', { at: 20_000 }), {
+    tab: { id: 42 }, documentId: 'document-old', documentLifecycle: 'active',
+  });
+  const reclaimed = await h.sendRuntimeMessage({
+    type: 'route-enter', pathHash: PATH_A, routeEpoch: 1, at: 21_000,
+  }, { tab: { id: 42 }, documentId: 'document-new', documentLifecycle: 'active' });
+  assert.equal(reclaimed.pending?.completionId, 'document-claim-race');
+
+  const stale = await h.sendRuntimeMessage({
+    type: 'route-enter', pathHash: PATH_A, routeEpoch: 2, at: 20_500,
+  }, { tab: { id: 42 }, documentId: 'document-old', documentLifecycle: 'active' });
+  assert.equal(stale.pending, null);
+  assert.equal(stale.reason, 'stale-document-claim');
+  assert.equal(h.sessionStore.turnbellFinalizationV2[`42:${PATH_A}`].documentId, 'document-new');
+
+  const staleTurnStart = await h.sendRuntimeMessage(turnStart('late-old-document-turn', {
+    routeEpoch: 2, at: 20_500, startedAt: 20_500,
+  }), { tab: { id: 42 }, documentId: 'document-old', documentLifecycle: 'active' });
+  assert.equal(staleTurnStart.ok, false);
+  assert.equal(staleTurnStart.reason, 'stale-document-claim');
+  assert.equal(h.sessionStore.turnbellFinalizationV2[`42:${PATH_A}`].completionId, 'document-claim-race');
+
+  const candidate = await h.sendRuntimeMessage(domCandidate('document-claim-race'), {
+    tab: { id: 42 }, documentId: 'document-new', documentLifecycle: 'active',
+  });
+  assert.equal(candidate.notificationStatus, 'delivered');
+});
+
+test('route recovery returns persisted evidence that generation had no prior final action', async () => {
+  const h = createHarness({ sound: false });
+  await h.sendRuntimeMessage(turnStart('persisted-generation-evidence', {
+    userCount: 1, assistantCount: 1,
+  }));
+  await h.sendRuntimeMessage({
+    type: 'turn-progress',
+    completionId: 'persisted-generation-evidence',
+    pathHash: PATH_A,
+    routeEpoch: 1,
+    sawGenerating: true,
+    sawGeneratingWithoutFinalAction: true,
+    phase: 'generating',
+    at: 11_000,
+  });
+
+  const recovered = await h.sendRuntimeMessage({
+    type: 'route-enter', pathHash: PATH_A, routeEpoch: 2, at: 12_000,
+  });
+  assert.equal(recovered.pending?.completionId, 'persisted-generation-evidence');
+  assert.equal(recovered.pending?.sawGeneratingWithoutFinalAction, true);
+});
+
 test('ordinary worker startup restores the active-turn watchdog without startup events', async () => {
   const sessionStore = {};
   const alarmsStore = {};
@@ -691,6 +847,25 @@ test('a switched-away route remains suspended until re-entered with a new epoch'
   assert.equal(h.notifications.length, 1);
 });
 
+test('a final candidate captured before route suspension can still be persisted on retry', async () => {
+  const h = createHarness({ sound: false });
+  await h.sendRuntimeMessage(turnStart('candidate-before-suspend'));
+  await h.sendRuntimeMessage({
+    type: 'turn-suspend',
+    completionId: 'candidate-before-suspend',
+    pathHash: PATH_A,
+    routeEpoch: 1,
+    at: 14_000,
+  });
+
+  const retried = await h.sendRuntimeMessage(domCandidate('candidate-before-suspend', {
+    event: { completedAt: 13_000 },
+  }));
+  assert.equal(retried.notificationStatus, 'delivered');
+  assert.equal(h.notifications.length, 1);
+  assert.equal(h.notifications[0].options.contextMessage, '用时 3.0 秒');
+});
+
 test('an active initial locked notification is not repeated after unlock', async () => {
   const h = createHarness({ sound: false }, { idleState: 'locked' });
   await h.sendRuntimeMessage(turnStart('locked-completion'));
@@ -706,7 +881,7 @@ test('an active initial locked notification is not repeated after unlock', async
   assert.match(h.notifications[0].id, /-lock-locked-completion-initial$/u);
   const queue = h.localStore.turnbellLockedReplayQueueV1;
   assert.equal(queue.length, 1);
-  assert.equal(queue[0].status, 'pending');
+  assert.equal(queue[0].status, 'initial-active');
   assert.equal(JSON.stringify(queue).includes('Private conversation title'), false);
   assert.equal(JSON.stringify(queue).includes('private-conversation'), false);
 
@@ -757,7 +932,7 @@ test('an extension notification query error keeps the locked replay queued for a
 
   await h.setIdleState('active');
   assert.equal(h.notifications.length, 1);
-  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'pending');
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'initial-active');
   assert.ok(h.alarmsStore['turnbell-active-turn-watchdog']);
 
   await h.closeNotification(initialId, false);
@@ -776,7 +951,7 @@ test('a Web Notification tag-query error is not treated as proof that the locked
 
   await h.setIdleState('active');
   assert.equal(h.webNotifications.length, 1);
-  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'pending');
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'initial-active');
   assert.ok(h.alarmsStore['turnbell-active-turn-watchdog']);
 
   h.setClock(80_000);
@@ -849,6 +1024,51 @@ test('unlock racing with initial notification creation waits and does not regres
   assert.equal(response.ok, true);
   assert.equal(h.notifications.length, 1);
   assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'initial-active');
+});
+
+test('unlock racing with a retry of a pending initial alert cannot create a second active id', async () => {
+  const h = createHarness({ sound: false }, { idleState: 'locked', failedNotificationCreates: 1 });
+  await h.sendRuntimeMessage(turnStart('pending-initial-retry-race'));
+  const initial = await h.sendRuntimeMessage(domCandidate('pending-initial-retry-race'));
+  assert.equal(initial.notificationStatus, 'pending');
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'pending');
+
+  const saved = Object.values(h.sessionStore.turnbellFinalizationV2)
+    .find((state) => state.completionId === 'pending-initial-retry-race');
+  h.setDeferNotificationCreate(true);
+  h.setClock(saved.notificationRetryAt + 1);
+  h.events.onAlarm.dispatch({ name: 'turnbell-active-turn-watchdog' });
+  await h.flush();
+  assert.equal(h.notifications.length, 2);
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'creating-initial');
+
+  await h.setIdleState('active');
+  assert.equal(h.notifications.length, 2);
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'creating-initial');
+  assert.equal(await h.completeNextNotificationCreate(), true);
+  await h.flush();
+
+  assert.equal(h.notifications.length, 2);
+  assert.deepEqual(h.activeNotificationIds(), ['turnbell-42-lock-pending-initial-retry-race-initial']);
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'initial-active');
+});
+
+test('a Web initial alert removed by the system is replayed after unlock without a close event', async () => {
+  const h = createHarness({ sound: false, notificationBackend: 'web' }, { idleState: 'locked' });
+  await h.sendRuntimeMessage(turnStart('web-initial-system-close'));
+  await h.sendRuntimeMessage(domCandidate('web-initial-system-close'));
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'initial-active');
+
+  await h.setIdleState('active');
+  assert.equal(h.webNotifications.length, 1);
+  h.webNotifications[0].close();
+  h.setClock(80_000);
+  h.events.onAlarm.dispatch({ name: 'turnbell-active-turn-watchdog' });
+  await h.flush();
+
+  assert.equal(h.webNotifications.length, 2);
+  assert.equal(h.webNotifications[1].options.data.notificationKind, 'unlock-replay');
+  assert.equal(h.localStore.turnbellLockedReplayQueueV1[0].status, 'replayed');
 });
 
 test('a user-dismissed locked notification acknowledges the replay record', async () => {

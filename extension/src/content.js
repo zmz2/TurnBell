@@ -77,9 +77,17 @@
   let completionGeneration = 0;
   let currentCompletionStartedAt = 0;
   let lastReportedGeneratingCompletionId = '';
+  let lastReportedGeneratingWithoutFinalActionCompletionId = '';
+  let currentTurnSawGeneratingWithoutFinalAction = false;
   let pendingRouteRecovery = null;
   let routeHandshakePending = false;
   let currentRoutePreviouslyCompleted = false;
+  let currentTurnEvidence = null;
+  let pendingPlaceholderMigration = null;
+  let routeMountGuard = null;
+  let lastSampledSnapshot = null;
+  let lastNonComposerInteractionAt = 0;
+  let lastPopstateAt = 0;
   let recoveryLastFingerprint = '';
   let recoveryStableSince = 0;
   let recoveryStableSamples = 0;
@@ -94,6 +102,8 @@
   let lastReportedRevisionBucket = 0;
   const routeHashCache = new Map();
   const recoveryBaselineFingerprints = new Map();
+  const pendingDomCandidates = new Map();
+  const progressMessagesInFlight = new Set();
 
   function routePath() {
     return `${String(location.pathname || '/')}${String(location.search || '')}`;
@@ -299,13 +309,14 @@
         path !== routePath()
         || epoch !== routeEpoch
       ) return;
-      routeHandshakePending = false;
       if (expectedCompletionGeneration !== completionGeneration) {
+        routeHandshakePending = false;
         currentRoutePreviouslyCompleted = false;
         scheduleSample(0);
         return;
       }
-      currentRoutePreviouslyCompleted = response?.previouslyCompleted === true;
+      const staleRouteClaim = ['stale-document-claim', 'stale-route-epoch'].includes(String(response?.reason || ''));
+      currentRoutePreviouslyCompleted = response?.previouslyCompleted === true || staleRouteClaim;
       const pending = response?.pending && typeof response.pending === 'object'
         ? response.pending
         : null;
@@ -318,9 +329,105 @@
         if (pendingCompletionId !== currentCompletionId) completionGeneration += 1;
         currentCompletionId = pendingCompletionId;
         currentCompletionStartedAt = Number(pending.startedAt) || 0;
+        currentTurnSawGeneratingWithoutFinalAction = pending.sawGeneratingWithoutFinalAction === true;
       }
+      if (!pending && response?.previouslyCompleted !== true && !staleRouteClaim
+        && tryBeginPlaceholderMigration(path, epoch)) return;
+      routeHandshakePending = false;
       scheduleSample(0);
     });
+  }
+
+  function isPlaceholderPath(path) {
+    return /^\/(?:|new|c\/new)\/?$/iu.test(String(path || '').split('?')[0]);
+  }
+
+  function isConversationPath(path) {
+    return /^\/c\/[^/]+\/?$/iu.test(String(path || '').split('?')[0]);
+  }
+
+  function tryBeginPlaceholderMigration(path, epoch) {
+    const migration = pendingPlaceholderMigration;
+    if (!migration) return false;
+    if (migration.expiresAt < Date.now() || migration.destinationPath !== path
+      || !isPlaceholderPath(migration.sourcePath) || !isConversationPath(path)
+      || lastNonComposerInteractionAt >= migration.startedAt
+      || lastPopstateAt >= migration.startedAt) {
+      pendingPlaceholderMigration = null;
+      return false;
+    }
+
+    const snapshot = snapshotForCycle();
+    const sameUserNodeIsMounted = snapshot.userTurns.some((turn) => (
+      turn.container && turn.container === migration.userContainer
+    ));
+    if (!sameUserNodeIsMounted) {
+      pendingPlaceholderMigration = null;
+      return false;
+    }
+
+    const generation = completionGeneration;
+    void routeHash(migration.sourcePath).then((fromPathHash) => {
+      if (path !== routePath() || epoch !== routeEpoch || generation !== completionGeneration) {
+        pendingPlaceholderMigration = null;
+        routeHandshakePending = false;
+        scheduleSample(0);
+        return;
+      }
+      sendRouteMessage({
+        type: 'turn-move',
+        completionId: migration.completionId,
+        fromPathHash,
+        routeMoveEvidence: 'shared-user-turn-node',
+        at: Date.now(),
+      }, path, epoch, (response) => {
+        if (path !== routePath() || epoch !== routeEpoch) return;
+        pendingPlaceholderMigration = null;
+        if (generation !== completionGeneration) {
+          routeHandshakePending = false;
+          scheduleSample(0);
+          return;
+        }
+        const pending = response?.ok && response?.pending && typeof response.pending === 'object'
+          ? response.pending
+          : null;
+        if (pending?.completionId === migration.completionId) {
+          currentCompletionId = migration.completionId;
+          currentCompletionStartedAt = Number(pending.startedAt) || migration.startedAt;
+          pendingRouteRecovery = pending;
+          currentRoutePreviouslyCompleted = false;
+          currentTurnEvidence = {
+            explicit: true,
+            baselineUserCount: migration.baselineUserCount,
+            userContainer: migration.userContainer,
+            intentAt: migration.startedAt,
+          };
+          currentTurnSawGeneratingWithoutFinalAction = migration.sawGeneratingWithoutFinalAction
+            || pending.sawGeneratingWithoutFinalAction === true;
+          routeMountGuard = null;
+          completionGeneration += 1;
+        }
+        routeHandshakePending = false;
+        scheduleSample(0);
+      });
+    }).catch((error) => {
+      log('placeholder route migration failed', error);
+      pendingPlaceholderMigration = null;
+      routeHandshakePending = false;
+      scheduleSample(0);
+    });
+    return true;
+  }
+
+  function sourceRouteStillMounted(snapshot) {
+    if (!routeMountGuard) return false;
+    const contains = (turns, container) => Boolean(container && turns.some((turn) => turn.container === container));
+    const sourceNodesMounted = contains(snapshot.userTurns, routeMountGuard.userContainer)
+      || contains(snapshot.assistantTurns, routeMountGuard.assistantContainer);
+    if (sourceNodesMounted) return true;
+    if (routeMountGuard.sourceWasGenerating && snapshot.isGenerating && !routeMountGuard.newIntent) return true;
+    routeMountGuard = null;
+    return false;
   }
 
   function reportLifecycle(lifecycle, extra = {}) {
@@ -353,10 +460,18 @@
       completionGeneration += 1;
       currentCompletionStartedAt = Number(pendingIntent?.at) || Number(snapshot?.now) || Date.now();
       lastReportedGeneratingCompletionId = '';
+      lastReportedGeneratingWithoutFinalActionCompletionId = '';
+      currentTurnSawGeneratingWithoutFinalAction = false;
       pendingRouteRecovery = null;
       recoveryLastFingerprint = '';
       recoveryStableSince = 0;
       recoveryStableSamples = 0;
+      currentTurnEvidence = {
+        explicit: source === 'explicit',
+        baselineUserCount: Number(snapshot?.userCount) || 0,
+        userContainer: source === 'explicit' ? null : (snapshot?.userTurns?.at(-1)?.container || null),
+        intentAt: Number(pendingIntent?.at) || Number(snapshot?.now) || Date.now(),
+      };
     }
     sendRouteMessage({
       type: 'turn-start',
@@ -378,12 +493,50 @@
       return;
     }
     const snapshot = snapshotForCycle();
+    if (routeMountGuard) routeMountGuard.newIntent = true;
     bootstrapGate.activate(at, 'user-intent');
     const key = `ui:${domAPI.fingerprint(location.pathname)}:${String(kind || 'request')}:${at}`;
-    pendingIntent = { key, at };
+    pendingIntent = { key, at, baselineUserCount: snapshot.userCount };
+    currentTurnEvidence = {
+      explicit: true,
+      baselineUserCount: snapshot.userCount,
+      userContainer: null,
+      intentAt: at,
+    };
     detector.arm?.({ ...snapshot, now: at });
     announceTurn(key, snapshot, 'explicit');
     scheduleSample(0);
+  }
+
+  function reportTurnProgress(snapshot, phase, completionId = currentCompletionId) {
+    const id = String(completionId || '');
+    if (!id) return;
+    if (snapshot?.isGenerating && snapshot.hasFinalAction !== true) {
+      currentTurnSawGeneratingWithoutFinalAction = true;
+    }
+    const sawWithoutFinalAction = currentTurnSawGeneratingWithoutFinalAction
+      || pendingRouteRecovery?.sawGeneratingWithoutFinalAction === true;
+    if (lastReportedGeneratingCompletionId === id
+      && (!sawWithoutFinalAction || lastReportedGeneratingWithoutFinalActionCompletionId === id)) return;
+    if (progressMessagesInFlight.has(id)) return;
+    progressMessagesInFlight.add(id);
+    sendRouteMessage({
+      type: 'turn-progress',
+      completionId: id,
+      sawGenerating: true,
+      sawGeneratingWithoutFinalAction: sawWithoutFinalAction,
+      phase: String(phase || 'generating'),
+      at: Number(snapshot?.now) || Date.now(),
+    }, currentPath, routeEpoch, (response) => {
+      progressMessagesInFlight.delete(id);
+      if (currentCompletionId !== id) return;
+      if (response?.ok) {
+        lastReportedGeneratingCompletionId = id;
+        if (sawWithoutFinalAction) lastReportedGeneratingWithoutFinalActionCompletionId = id;
+      } else {
+        globalThis.setTimeout(() => scheduleSample(0), 1_500);
+      }
+    });
   }
 
   function handleCycleTransition(snapshot, state) {
@@ -402,7 +555,73 @@
     pendingIntent = null;
   }
 
-  function sendDomCandidate(event, snapshot, completionId = currentCompletionId) {
+  function observeCurrentTurnUser(snapshot) {
+    if (!currentTurnEvidence || currentTurnEvidence.userContainer) return;
+    const baseline = Math.max(0, Number(currentTurnEvidence.baselineUserCount) || 0);
+    if (snapshot.userCount <= baseline) return;
+    currentTurnEvidence.userContainer = snapshot.userTurns.at(-1)?.container || null;
+  }
+
+  function candidateIsDurablyHandled(response) {
+    const terminalSuppression = response?.suppressed === true
+      && ['already-notified', 'settings', 'expired-turn'].includes(String(response.reason || ''));
+    return Boolean(response?.ok && (
+      terminalSuppression
+      || ['pending', 'delivered', 'suppressed'].includes(String(response.notificationStatus || ''))
+    ));
+  }
+
+  function queueDomCandidate(candidate) {
+    if (!candidate?.completionId) return;
+    const existing = pendingDomCandidates.get(candidate.completionId);
+    if (existing) {
+      deliverDomCandidate(existing);
+      return;
+    }
+    pendingDomCandidates.set(candidate.completionId, candidate);
+    deliverDomCandidate(candidate);
+  }
+
+  function deliverDomCandidate(candidate) {
+    if (!candidate || candidate.inFlight || candidate.retryAt > Date.now()) return;
+    candidate.inFlight = true;
+    candidate.attempts += 1;
+    const message = {
+      type: 'dom-final-candidate',
+      completionId: candidate.completionId,
+      at: candidate.event.completedAt,
+      payload: {
+        event: candidate.event,
+        context: candidate.context,
+      },
+    };
+    sendRouteMessage(message, candidate.path, candidate.epoch, (response) => {
+      candidate.inFlight = false;
+      if (candidateIsDurablyHandled(response)) {
+        pendingDomCandidates.delete(candidate.completionId);
+        if (candidate.completionId === currentCompletionId) pendingRouteRecovery = null;
+        recoveryBaselineFingerprints.delete(candidate.completionId);
+        return;
+      }
+      const delay = Math.min(60_000, 1_500 * (2 ** Math.min(5, candidate.attempts - 1)));
+      candidate.retryAt = Date.now() + delay;
+      log('candidate delivery deferred for retry', {
+        completionId: candidate.completionId,
+        attempts: candidate.attempts,
+        reason: response?.reason || response?.error || 'no-response',
+      });
+      globalThis.setTimeout(() => scheduleSample(0), delay);
+    }, true);
+  }
+
+  function retryPendingDomCandidates() {
+    const now = Date.now();
+    for (const candidate of pendingDomCandidates.values()) {
+      if (!candidate.inFlight && candidate.retryAt <= now) deliverDomCandidate(candidate);
+    }
+  }
+
+  function sendDomCandidate(event, snapshot, completionId = currentCompletionId, path = currentPath, epoch = routeEpoch) {
     reportLifecycle('candidate-sent', {
       at: snapshot.now,
       assistantCount: snapshot.assistantCount,
@@ -411,30 +630,22 @@
       hasFinalAction: snapshot.hasFinalAction,
       detectorPhase: detector.getState?.().phase || '',
     });
-    sendRouteMessage({
-      type: 'dom-final-candidate',
-      completionId,
-      payload: {
-        event: {
-          type: 'complete',
-          durationMs: Number(event.durationMs) || 0,
-          startedAt: Number(event.startedAt) || currentCompletionStartedAt || snapshot.now,
-          completedAt: Number(event.completedAt) || snapshot.now,
-          hasFinalAction: snapshot.hasFinalAction === true,
-          finalEvidence: String(event.finalEvidence || (snapshot.hasFinalAction ? 'final-action' : '')),
-        },
-        context: pageContext(snapshot),
+    queueDomCandidate({
+      completionId: String(completionId || ''),
+      path,
+      epoch,
+      attempts: 0,
+      retryAt: 0,
+      inFlight: false,
+      event: {
+        type: 'complete',
+        durationMs: Number(event.durationMs) || 0,
+        startedAt: Number(event.startedAt) || currentCompletionStartedAt || snapshot.now,
+        completedAt: Number(event.completedAt) || snapshot.now,
+        hasFinalAction: snapshot.hasFinalAction === true,
+        finalEvidence: String(event.finalEvidence || (snapshot.hasFinalAction ? 'final-action' : '')),
       },
-    }, currentPath, routeEpoch, (response) => {
-      const terminalSuppression = response?.suppressed === true
-        && ['already-notified', 'settings', 'expired-turn'].includes(String(response.reason || ''));
-      const durablyHandled = ['pending', 'delivered', 'suppressed'].includes(
-        String(response?.notificationStatus || ''),
-      );
-      if (response?.ok && (terminalSuppression || durablyHandled)) {
-        pendingRouteRecovery = null;
-        recoveryBaselineFingerprints.delete(String(completionId || ''));
-      }
+      context: pageContext(snapshot),
     });
   }
 
@@ -491,6 +702,40 @@
     const now = Date.now();
     const state = detector.getState?.() || { phase: 'idle' };
     const recoveryWasPending = pendingRouteRecovery?.completionId === currentCompletionId;
+    const candidateWasPending = pendingDomCandidates.has(currentCompletionId);
+    const sourceSnapshot = lastSampledSnapshot;
+    const sourceWasGenerating = snapshotGeneratingEvidence(sourceSnapshot, state);
+    const sourceSawGeneratingWithoutFinalAction = currentTurnSawGeneratingWithoutFinalAction;
+    const turnEvidence = currentTurnEvidence;
+    const sharedTurnUserContainer = turnEvidence?.explicit === true
+      ? turnEvidence.userContainer
+      : null;
+    pendingPlaceholderMigration = null;
+    if (currentCompletionId && isPlaceholderPath(oldPath) && isConversationPath(nextPath)
+      && sharedTurnUserContainer && turnEvidence?.intentAt
+      && lastNonComposerInteractionAt < Number(turnEvidence.intentAt)
+      && lastPopstateAt < Number(turnEvidence.intentAt)) {
+      pendingPlaceholderMigration = {
+        completionId: currentCompletionId,
+        sourcePath: oldPath,
+        destinationPath: nextPath,
+        userContainer: sharedTurnUserContainer,
+        baselineUserCount: Number(turnEvidence.baselineUserCount) || 0,
+        sawGeneratingWithoutFinalAction: sourceSawGeneratingWithoutFinalAction,
+        startedAt: Number(turnEvidence.intentAt) || now,
+        expiresAt: now + 10_000,
+      };
+    }
+    if (currentCompletionId && (state.phase !== 'idle' || recoveryWasPending || sourceWasGenerating)) {
+      routeMountGuard = {
+        userContainer: sourceSnapshot?.userTurns?.at(-1)?.container || null,
+        assistantContainer: sourceSnapshot?.assistantTurns?.at(-1)?.container || null,
+        sourceWasGenerating,
+        newIntent: false,
+      };
+    } else {
+      routeMountGuard = null;
+    }
     if (currentCompletionId && lastObservedFingerprint) {
       recoveryBaselineFingerprints.set(currentCompletionId, lastObservedFingerprint);
       while (recoveryBaselineFingerprints.size > 12) {
@@ -506,7 +751,7 @@
     recoveryStableSince = 0;
     recoveryStableSamples = 0;
 
-    if ((state.phase !== 'idle' || recoveryWasPending) && currentCompletionId) {
+    if ((state.phase !== 'idle' || recoveryWasPending || candidateWasPending) && currentCompletionId) {
       sendRouteMessage({ type: 'turn-suspend', completionId: currentCompletionId, at: now }, oldPath, oldEpoch, null, true);
     }
     detector.reset();
@@ -519,9 +764,16 @@
     currentCompletionId = '';
     currentCompletionStartedAt = 0;
     lastReportedGeneratingCompletionId = '';
+    lastReportedGeneratingWithoutFinalActionCompletionId = '';
+    currentTurnEvidence = null;
+    currentTurnSawGeneratingWithoutFinalAction = false;
     enterCurrentRoute();
     log('SPA navigation entered an isolated silent baseline', { routeEpoch });
     return true;
+  }
+
+  function snapshotGeneratingEvidence(snapshot, state) {
+    return Boolean(snapshot?.isGenerating || state?.sawGenerating === true);
   }
 
   function evaluateRouteRecovery(snapshot) {
@@ -530,16 +782,14 @@
 
     if (snapshot.isGenerating) {
       pending.sawGenerating = true;
+      if (!snapshot.hasFinalAction) {
+        pending.sawGeneratingWithoutFinalAction = true;
+        currentTurnSawGeneratingWithoutFinalAction = true;
+      }
       recoveryLastFingerprint = '';
       recoveryStableSince = 0;
       recoveryStableSamples = 0;
-      if (lastReportedGeneratingCompletionId !== currentCompletionId) {
-        lastReportedGeneratingCompletionId = currentCompletionId;
-        sendRouteMessage({
-          type: 'turn-progress', completionId: currentCompletionId,
-          sawGenerating: true, phase: 'generating', at: snapshot.now,
-        });
-      }
+      reportTurnProgress(snapshot, 'generating');
       return true;
     }
 
@@ -552,16 +802,28 @@
       && snapshot.fingerprint
       && snapshot.fingerprint !== baselineFingerprint
     );
+    const sameCountGenerationEvidence = snapshot.assistantCount === baselineAssistantCount
+      && pending.sawGeneratingWithoutFinalAction === true;
     if (
       snapshot.userCount < baselineUserCount
       || snapshot.assistantCount < baselineAssistantCount
       || (snapshot.assistantCount === baselineAssistantCount
-        && !sameCountFingerprintChanged)
+        && !sameCountFingerprintChanged
+        && !sameCountGenerationEvidence)
     ) {
       recoveryLastFingerprint = '';
       recoveryStableSince = 0;
       recoveryStableSamples = 0;
       return true;
+    }
+
+    const recoverySignature = `${snapshot.fingerprint}:${snapshot.hasFinalAction ? 'action' : 'no-action'}`;
+    if (recoverySignature !== recoveryLastFingerprint) {
+      recoveryLastFingerprint = recoverySignature;
+      recoveryStableSince = snapshot.now;
+      recoveryStableSamples = 1;
+    } else {
+      recoveryStableSamples += 1;
     }
 
     const actionlessEligible = (
@@ -570,15 +832,6 @@
       && pending.sawGenerating !== true
     );
     if (snapshot.hasFinalAction !== true && !actionlessEligible) return true;
-
-    if (snapshot.fingerprint !== recoveryLastFingerprint) {
-      recoveryLastFingerprint = snapshot.fingerprint;
-      recoveryStableSince = snapshot.now;
-      recoveryStableSamples = 1;
-      return true;
-    }
-
-    recoveryStableSamples += 1;
     const quietMs = actionlessEligible
       ? Math.max(3_000, settings.quietPeriodMs)
       : settings.quietPeriodMs;
@@ -595,6 +848,7 @@
 
   function sample() {
     try {
+      retryPendingDomCandidates();
       const oldPath = currentPath;
       resetForNavigation();
       if (oldPath !== currentPath) {
@@ -603,6 +857,8 @@
         return;
       }
       let snapshot = snapshotForCycle();
+      lastSampledSnapshot = snapshot;
+      observeCurrentTurnUser(snapshot);
       if (routeHandshakePending) return;
       sampleCount += 1;
       const sampleGapMs = lastSampleAt ? Math.max(0, snapshot.now - lastSampleAt) : 0;
@@ -611,6 +867,14 @@
         lastObservedFingerprint = snapshot.fingerprint;
       }
       lastSampleAt = snapshot.now;
+      if (sourceRouteStillMounted(snapshot)) {
+        reportSampleState(snapshot, detector.getState(), sampleGapMs);
+        return;
+      }
+      if (currentCompletionId && currentTurnSawGeneratingWithoutFinalAction
+        && lastReportedGeneratingWithoutFinalActionCompletionId !== currentCompletionId) {
+        reportTurnProgress(snapshot, detector.getState?.().phase || 'generating');
+      }
       if (currentRoutePreviouslyCompleted && !pendingIntent && !pendingRouteRecovery) {
         detector.reset();
         currentTurnKey = '';
@@ -652,22 +916,16 @@
       handleCycleTransition(snapshot, state);
       reportSampleState(snapshot, state, sampleGapMs);
 
-      if (
-        state.sawGenerating === true
-        && currentCompletionId
-        && lastReportedGeneratingCompletionId !== currentCompletionId
-      ) {
-        lastReportedGeneratingCompletionId = currentCompletionId;
-        sendRouteMessage({
-          type: 'turn-progress', completionId: currentCompletionId,
-          sawGenerating: true, phase: state.phase, at: snapshot.now,
-        });
+      if (state.sawGenerating === true || snapshot.isGenerating || currentTurnSawGeneratingWithoutFinalAction) {
+        reportTurnProgress(snapshot, state.phase);
       }
 
       if (event) {
         lastSettleKey = '';
         // Refresh once: action controls can be inserted in the same render batch.
         snapshot = snapshotForCycle(state.cycleNumber);
+        lastSampledSnapshot = snapshot;
+        observeCurrentTurnUser(snapshot);
         const finalEvidence = String(event.finalEvidence || '');
         if (finalEvidence === 'final-action' && !snapshot.hasFinalAction) {
           log('candidate rejected: final action disappeared before confirmation');
@@ -799,8 +1057,19 @@
       noteUserIntent('enter');
     }, true);
     document.addEventListener('click', (event) => {
-      const target = event?.target?.closest?.(USER_INTENT_SELECTOR);
-      if (target) noteUserIntent('button');
+      const rawTarget = event?.target;
+      const intentTarget = rawTarget?.closest?.(USER_INTENT_SELECTOR);
+      let composerTarget = false;
+      try {
+        composerTarget = Boolean(rawTarget?.closest?.(COMPOSER_SELECTOR)
+          || rawTarget?.matches?.(COMPOSER_SELECTOR));
+      } catch { composerTarget = false; }
+      const anchor = rawTarget?.closest?.('a[href]');
+      if (!intentTarget && !composerTarget
+        && (anchor || rawTarget?.closest?.('button,[role="button"],[role="link"]'))) {
+        lastNonComposerInteractionAt = Date.now();
+      }
+      if (intentTarget) noteUserIntent('button');
     }, true);
     globalThis.addEventListener?.('pageshow', (event) => {
       reportLifecycle('pageshow', { persisted: event?.persisted === true });
@@ -810,7 +1079,10 @@
     globalThis.addEventListener?.('pagehide', (event) => {
       reportLifecycle('pagehide', { persisted: event?.persisted === true });
     });
-    globalThis.addEventListener?.('popstate', () => scheduleSample(0));
+    globalThis.addEventListener?.('popstate', () => {
+      lastPopstateAt = Date.now();
+      scheduleSample(0);
+    });
     globalThis.addEventListener?.('focus', () => {
       reportLifecycle('focus');
       lastSettleKey = '';

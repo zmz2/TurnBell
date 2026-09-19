@@ -19,6 +19,7 @@ const WATCHDOG_ALARM = 'turnbell-active-turn-watchdog';
 const LOCK_REPLAY_STORAGE_KEY = 'turnbellLockedReplayQueueV1';
 const LOCK_REPLAY_TTL_MS = 24 * 60 * 60 * 1_000;
 const LOCK_REPLAY_QUEUE_LIMIT = 20;
+const LOCK_INITIAL_IN_FLIGHT_GRACE_MS = 10_000;
 const NOTIFICATION_RETRY_BASE_MS = 60 * 1_000;
 const NOTIFICATION_RETRY_MAX_MS = 15 * 60 * 1_000;
 const DOCUMENT_BOUND_MESSAGE_TYPES = new Set([
@@ -33,6 +34,7 @@ let diagnosticMutation = Promise.resolve();
 let lockReplayMutation = Promise.resolve();
 let lockReplayFlush = Promise.resolve();
 let workerRecoveryPromise = null;
+let watchdogAlarmKnown = false;
 const lockInitialNotificationsInFlight = new Set();
 const notificationDeliveriesInFlight = new Map();
 
@@ -50,11 +52,17 @@ function storageSet(items) {
   });
 }
 
-function localGet(defaults) {
+function localGetResult(defaults) {
   return new Promise((resolve) => {
-    chrome.storage.local.get(defaults, (items) => {
-      resolve(chrome.runtime.lastError ? defaults : items);
-    });
+    try {
+      chrome.storage.local.get(defaults, (items) => {
+        resolve(chrome.runtime.lastError
+          ? { ok: false, items: defaults }
+          : { ok: true, items: items || defaults });
+      });
+    } catch {
+      resolve({ ok: false, items: defaults });
+    }
   });
 }
 
@@ -64,13 +72,23 @@ function localSet(items) {
   });
 }
 
-function sessionGet(defaults) {
-  if (!chrome.storage.session) return Promise.resolve(defaults);
+function sessionGetResult(defaults) {
+  if (!chrome.storage.session) return Promise.resolve({ ok: false, items: defaults });
   return new Promise((resolve) => {
-    chrome.storage.session.get(defaults, (items) => {
-      resolve(chrome.runtime.lastError ? defaults : items);
-    });
+    try {
+      chrome.storage.session.get(defaults, (items) => {
+        resolve(chrome.runtime.lastError
+          ? { ok: false, items: defaults }
+          : { ok: true, items: items || defaults });
+      });
+    } catch {
+      resolve({ ok: false, items: defaults });
+    }
   });
+}
+
+function sessionGet(defaults) {
+  return sessionGetResult(defaults).then((result) => result.ok ? result.items : defaults);
 }
 
 function sessionSet(items) {
@@ -161,6 +179,17 @@ async function showBrowserNotification(payload, settings) {
   const tabPart = Number.isInteger(payload.tabId) ? payload.tabId : 'unknown';
   const notificationId = String(payload.notificationId || `${NOTIFICATION_PREFIX}${tabPart}-${Date.now()}`);
   const activeBeforeCreate = await getActiveNotifications();
+  if (!activeBeforeCreate.ok) {
+    return {
+      created: false,
+      active: null,
+      id: null,
+      permission: 'unknown',
+      diagnostic: 'active-query-unverified',
+      error: 'Could not verify whether this notification is already active.',
+      createdAt: 0,
+    };
+  }
   if (activeBeforeCreate.ok && Object.hasOwn(activeBeforeCreate.items, notificationId)) {
     return {
       created: true,
@@ -414,7 +443,9 @@ async function resolvedContext(tabId, rawContext = {}, preserveCapturedVisibilit
 
 function withLockReplayMutation(updater) {
   const run = lockReplayMutation.then(async () => {
-    const items = await localGet({ [LOCK_REPLAY_STORAGE_KEY]: [] });
+    const read = await localGetResult({ [LOCK_REPLAY_STORAGE_KEY]: [] });
+    if (!read.ok) throw new Error('locked-replay-store-read-failed');
+    const items = read.items;
     const queue = Array.isArray(items[LOCK_REPLAY_STORAGE_KEY])
       ? items[LOCK_REPLAY_STORAGE_KEY]
       : [];
@@ -501,6 +532,7 @@ async function enqueueLockedReplay(item) {
           ? String(item.notificationBackend)
           : 'extension',
         status: 'creating-initial',
+        initialAttemptAt: now,
         attempts: 0,
         expiresAt: now + LOCK_REPLAY_TTL_MS,
         tabClosed: false,
@@ -596,7 +628,7 @@ async function pendingReplayItems() {
   return withLockReplayMutation((queue) => {
     pruneLockReplayQueue(queue);
     return queue
-      .filter((item) => ['creating-initial', 'pending', 'creating-replay'].includes(String(item.status)))
+      .filter((item) => ['creating-initial', 'initial-active', 'pending', 'creating-replay'].includes(String(item.status)))
       .map((item) => ({ ...item }));
   });
 }
@@ -621,7 +653,11 @@ async function performPendingLockedReplayFlush() {
     if (snapshot.expiresAt && snapshot.expiresAt <= Date.now()) continue;
     // A live request may still be creating the original notification. After a
     // worker restart this in-memory marker is gone, so the orphan is recovered.
-    if (snapshot.status === 'creating-initial' && lockInitialNotificationsInFlight.has(snapshot.completionId)) continue;
+    if (snapshot.status === 'creating-initial') {
+      if (lockInitialNotificationsInFlight.has(snapshot.completionId)) continue;
+      const initialAttemptAt = Number(snapshot.initialAttemptAt) || 0;
+      if (initialAttemptAt > 0 && Date.now() - initialAttemptAt < LOCK_INITIAL_IN_FLIGHT_GRACE_MS) continue;
+    }
     if (snapshot.status === 'pending'
       && Number(snapshot.lastAttemptAt) > 0
       && Date.now() - Number(snapshot.lastAttemptAt) < 10_000) continue;
@@ -680,7 +716,7 @@ async function performPendingLockedReplayFlush() {
     let tabClosed = snapshot.tabClosed === true;
     if (!tabClosed && Number.isInteger(snapshot.tabId)) tabClosed = !(await getTab(snapshot.tabId));
     const marked = await updateLockedReplay(snapshot.completionId, (entry) => {
-      if (!['creating-initial', 'pending', 'creating-replay'].includes(String(entry.status))) return null;
+      if (!['creating-initial', 'initial-active', 'pending', 'creating-replay'].includes(String(entry.status))) return null;
       entry.status = 'creating-replay';
       entry.attempts = Math.max(0, Number(entry.attempts) || 0) + 1;
       entry.lastAttemptAt = Date.now();
@@ -747,9 +783,14 @@ async function reconcileLockedReplayQueue() {
 
 async function loadFinalizationStore() {
   if (!finalizationStorePromise) {
-    finalizationStorePromise = sessionGet({ [FINALIZATION_STORAGE_KEY]: {} }).then((items) => {
-      const value = items?.[FINALIZATION_STORAGE_KEY];
+    const readPromise = sessionGetResult({ [FINALIZATION_STORAGE_KEY]: {} }).then((read) => {
+      if (!read.ok) throw new Error('finalization-store-read-failed');
+      const value = read.items?.[FINALIZATION_STORAGE_KEY];
       return value && typeof value === 'object' ? value : {};
+    });
+    finalizationStorePromise = readPromise;
+    void readPromise.catch(() => {
+      if (finalizationStorePromise === readPromise) finalizationStorePromise = null;
     });
   }
   return finalizationStorePromise;
@@ -850,6 +891,7 @@ function pendingRouteSummary(state) {
     baselineAssistantCount: Number(state.baselineAssistantCount) || 0,
     startSource: String(state.startSource || 'implicit'),
     sawGenerating: state.sawGenerating === true,
+    sawGeneratingWithoutFinalAction: state.sawGeneratingWithoutFinalAction === true,
     phase: String(state.phase || 'waiting'),
     expiresAt: Number(state.expiresAt) || 0,
   };
@@ -964,24 +1006,76 @@ async function pruneExpiredFinalizationRecords() {
   return queueFinalizationMutation(async () => ({ pruned: true }));
 }
 
-async function refreshWatchdogAlarm() {
-  if (!chrome.alarms?.create) return false;
-  const pendingTurns = await activeFinalizationEntries();
-  const pendingNotifications = await pendingNotificationEntries();
-  const pendingLockedReplays = await pendingReplayItems();
-  if (pendingTurns.length === 0 && pendingNotifications.length === 0 && pendingLockedReplays.length === 0) {
-    try { await chrome.alarms.clear(WATCHDOG_ALARM); } catch { /* optional on older builds */ }
-    return false;
+function readWatchdogAlarm() {
+  if (typeof chrome.alarms?.get === 'function') {
+    return new Promise((resolve) => {
+      try {
+        chrome.alarms.get(WATCHDOG_ALARM, (alarm) => {
+          resolve(chrome.runtime.lastError
+            ? { ok: false, alarm: null }
+            : { ok: true, alarm: alarm || null });
+        });
+      } catch {
+        resolve({ ok: false, alarm: null });
+      }
+    });
   }
+  if (typeof chrome.alarms?.getAll === 'function') {
+    return new Promise((resolve) => {
+      try {
+        chrome.alarms.getAll((alarms) => {
+          resolve(chrome.runtime.lastError
+            ? { ok: false, alarm: null }
+            : { ok: true, alarm: (alarms || []).find((item) => item.name === WATCHDOG_ALARM) || null });
+        });
+      } catch {
+        resolve({ ok: false, alarm: null });
+      }
+    });
+  }
+  return Promise.resolve({ ok: false, alarm: null });
+}
+
+async function ensureWatchdogAlarm() {
+  const current = await readWatchdogAlarm();
+  if (current.ok && current.alarm && Number(current.alarm.periodInMinutes) >= 1) {
+    watchdogAlarmKnown = true;
+    return true;
+  }
+  if (!current.ok && watchdogAlarmKnown) return true;
   try {
-    // One minute also respects pre-Chrome-120 builds, whose packaged alarms
-    // have a less predictable minimum period than current Chromium.
     await chrome.alarms.create(WATCHDOG_ALARM, { delayInMinutes: 1, periodInMinutes: 1 });
+    watchdogAlarmKnown = true;
     return true;
   } catch (error) {
     console.warn('[TurnBell] watchdog alarm could not be scheduled', error);
     return false;
   }
+}
+
+async function refreshWatchdogAlarm() {
+  if (!chrome.alarms?.create) return false;
+  let pendingTurns;
+  let pendingNotifications;
+  let pendingLockedReplays;
+  try {
+    pendingTurns = await activeFinalizationEntries();
+    pendingNotifications = await pendingNotificationEntries();
+    pendingLockedReplays = await pendingReplayItems();
+  } catch (error) {
+    console.warn('[TurnBell] watchdog state read failed; retaining alarm', error);
+    return ensureWatchdogAlarm();
+  }
+  if (pendingTurns.length === 0 && pendingNotifications.length === 0 && pendingLockedReplays.length === 0) {
+    try {
+      await chrome.alarms.clear(WATCHDOG_ALARM);
+      watchdogAlarmKnown = false;
+    } catch { /* optional on older builds */ }
+    return false;
+  }
+  // Re-creating an existing named alarm resets its due time. Keep the current
+  // recurring schedule so frequent route updates cannot starve outbox retries.
+  return ensureWatchdogAlarm();
 }
 
 async function runWatchdogAlarm() {
@@ -1149,10 +1243,13 @@ async function notifyFromFinal(tabId, action, event = {}, rawContext = {}) {
     payload.webTag = ids.initialWebTag;
     payload.completionId = completionId;
     payload.notificationKind = 'locked-initial';
-    if (!lockItem) {
-      lockInitialNotificationsInFlight.add(completionId);
-      initialInFlight = true;
-      try {
+    if (lockInitialNotificationsInFlight.has(completionId)) {
+      return { ok: true, notificationStatus: 'pending', deliveryPending: true, deferred: true };
+    }
+    lockInitialNotificationsInFlight.add(completionId);
+    initialInFlight = true;
+    try {
+      if (!lockItem) {
         lockItem = await enqueueLockedReplay({
           completionId,
           tabId,
@@ -1164,10 +1261,35 @@ async function notifyFromFinal(tabId, action, event = {}, rawContext = {}) {
           replayWebTag: ids.replayWebTag,
           notificationBackend: settings.notificationBackend,
         });
-      } catch (error) {
-        lockInitialNotificationsInFlight.delete(completionId);
-        throw error;
+      } else {
+        const claimAt = Date.now();
+        lockItem = await updateLockedReplay(completionId, (entry) => {
+          if (['initial-active', 'replayed', 'acknowledged', 'creating-replay'].includes(String(entry.status))) return null;
+          const previousAttemptAt = Number(entry.initialAttemptAt) || 0;
+          if (entry.status === 'creating-initial'
+            && previousAttemptAt > 0
+            && claimAt - previousAttemptAt < LOCK_INITIAL_IN_FLIGHT_GRACE_MS) return null;
+          entry.status = 'creating-initial';
+          entry.initialAttemptAt = claimAt;
+          entry.initialNotificationId = ids.initial;
+          entry.replayNotificationId = ids.replay;
+          entry.initialWebTag = ids.initialWebTag;
+          entry.replayWebTag = ids.replayWebTag;
+          return { ...entry };
+        });
       }
+      if (!lockItem || lockItem.status !== 'creating-initial') {
+        lockInitialNotificationsInFlight.delete(completionId);
+        initialInFlight = false;
+        if (lockedReplayIsTerminal(lockItem)) {
+          return { ok: true, terminal: true, notificationStatus: 'delivered', routes: { browser: false, web: false } };
+        }
+        return { ok: true, notificationStatus: 'pending', deliveryPending: true, deferred: true };
+      }
+    } catch (error) {
+      lockInitialNotificationsInFlight.delete(completionId);
+      initialInFlight = false;
+      throw error;
     }
   } else {
     const ids = completionNotificationIds(tabId, completionId);
@@ -1180,18 +1302,32 @@ async function notifyFromFinal(tabId, action, event = {}, rawContext = {}) {
   let routes;
   try {
     routes = await routeNotification(payload, settings);
+  } catch (error) {
+    if (lockItem) {
+      await updateLockedReplay(completionId, (entry) => {
+        if (entry.status === 'creating-initial') entry.status = 'pending';
+        return entry;
+      }).catch(() => undefined);
+    }
+    throw error;
   } finally {
     if (initialInFlight) lockInitialNotificationsInFlight.delete(completionId);
   }
   if (lockItem) {
     await updateLockedReplay(completionId, (entry) => {
       if (entry.status === 'creating-initial') {
-        entry.status = 'pending';
+        entry.status = entry.initialClosed
+          ? 'pending'
+          : ((routes.browser || routes.web) ? 'initial-active' : 'pending');
+        if (entry.status === 'initial-active') entry.initialActiveAt = entry.initialActiveAt || Date.now();
         entry.initialNotificationId = String(routes.notificationId || payload.notificationId || '');
         entry.initialWebTag = String(routes.webTag || payload.webTag || '');
       }
       return entry;
     });
+    if (routes.browser || routes.web) {
+      await markNotificationDeliveredByCompletion(tabId, completionId);
+    }
     if (await queryIdleState() !== 'locked') await flushPendingLockedReplays();
     const latestLockItem = await getLockedReplay(completionId);
     if (lockedReplayIsTerminal(latestLockItem)) {
@@ -1335,16 +1471,28 @@ async function handleTurnStart(message, sender) {
   const pathHash = String(message.pathHash || '');
   const completionId = String(message.completionId || '');
   if (!pathHash || !completionId) return { ok: false, error: 'missing-route-identity' };
+  const eventAt = Number(message.at) || Date.now();
   const result = await mutateFinalization(tabId, pathHash, (state, store) => {
     const previous = finalizationAPI.normalizeState(state);
+    const incomingDocumentId = String(sender?.documentId || '');
+    const existingDocumentId = String(previous?.documentId || '');
+    const previousClaimAt = Number(previous?.documentClaimAt) || Number(previous?.lastActivityAt) || 0;
+    if (previous && incomingDocumentId && existingDocumentId && incomingDocumentId !== existingDocumentId
+      && eventAt <= previousClaimAt) {
+      return { state: previous, action: { type: 'suppress', reason: 'stale-document-claim' } };
+    }
+    if (previous && incomingDocumentId && existingDocumentId === incomingDocumentId
+      && (Number(message.routeEpoch) || 0) < previous.routeEpoch) {
+      return { state: previous, action: { type: 'suppress', reason: 'stale-route-epoch' } };
+    }
     const next = finalizationAPI.beginTurn(state, {
       tabId,
       documentId: String(sender?.documentId || ''),
       pathHash,
       routeEpoch: Number(message.routeEpoch) || 0,
       completionId,
-      at: Number(message.at) || Date.now(),
-      startedAt: Number(message.startedAt) || Number(message.at) || Date.now(),
+      at: eventAt,
+      startedAt: Number(message.startedAt) || eventAt,
       userCount: Number(message.userCount) || 0,
       assistantCount: Number(message.assistantCount) || 0,
       tabHidden: message.tabHidden === true,
@@ -1354,6 +1502,9 @@ async function handleTurnStart(message, sender) {
     return next;
   });
   await refreshWatchdogAlarm();
+  if (result.action.type === 'suppress') {
+    return { ok: false, action: result.action.type, reason: result.action.reason || '' };
+  }
   void recordLifecycleDiagnostic({
     type: 'turn-start', at: Number(message.at) || Date.now(), pathHash,
     routeEpoch: Number(message.routeEpoch) || 0, lifecycle: 'candidate-received',
@@ -1379,6 +1530,8 @@ async function handleTurnProgress(message, sender) {
       return { state, action: { type: 'suppress', reason: 'stale-route-epoch' } };
     }
     state.sawGenerating = state.sawGenerating || message.sawGenerating === true;
+    state.sawGeneratingWithoutFinalAction = state.sawGeneratingWithoutFinalAction
+      || message.sawGeneratingWithoutFinalAction === true;
     if (state.sawGenerating) state.phase = String(message.phase || 'generating');
     state.lastActivityAt = Math.max(state.lastActivityAt, Number(message.at) || Date.now());
     return { state, action: { type: 'updated' } };
@@ -1391,6 +1544,9 @@ async function handleRouteEnter(message, sender) {
   const pathHash = String(message.pathHash || '');
   if (!Number.isInteger(tabId) || !pathHash) return { ok: false, error: 'missing-route-identity' };
   const now = Date.now();
+  const claimAt = Number(message.at) || now;
+  const documentId = String(sender?.documentId || '');
+  const routeEpoch = Math.max(0, Math.trunc(Number(message.routeEpoch) || 0));
   const result = await mutateFinalization(tabId, pathHash, (rawState) => {
     const state = finalizationAPI.normalizeState(rawState);
     if (!state || (state.expiresAt && state.expiresAt <= now)) {
@@ -1399,9 +1555,19 @@ async function handleRouteEnter(message, sender) {
     if (state.notified) {
       return { state, action: { type: 'no-pending', previouslyCompleted: true } };
     }
-    state.documentId = String(sender?.documentId || state.documentId);
-    state.routeEpoch = Math.max(0, Math.trunc(Number(message.routeEpoch) || 0));
+    const differentDocument = Boolean(state.documentId && documentId && state.documentId !== documentId);
+    const previousClaimAt = Number(state.documentClaimAt) || Number(state.lastActivityAt) || 0;
+    if (differentDocument && claimAt <= previousClaimAt) {
+      return { state, action: { type: 'no-pending', reason: 'stale-document-claim' } };
+    }
+    if (!differentDocument && routeEpoch < state.routeEpoch) {
+      return { state, action: { type: 'no-pending', reason: 'stale-route-epoch' } };
+    }
+    state.documentId = documentId || state.documentId;
+    state.routeEpoch = differentDocument ? routeEpoch : Math.max(state.routeEpoch, routeEpoch);
+    state.documentClaimAt = Math.max(state.documentClaimAt, claimAt);
     state.suspended = false;
+    state.suspendedAt = 0;
     state.lastActivityAt = Math.max(state.lastActivityAt, now);
     return { state, action: { type: 'pending', pending: pendingRouteSummary(state) } };
   });
@@ -1410,6 +1576,7 @@ async function handleRouteEnter(message, sender) {
     ok: true,
     pending: result.action.pending || null,
     previouslyCompleted: result.action.previouslyCompleted === true,
+    reason: result.action.reason || '',
   };
 }
 
@@ -1434,9 +1601,17 @@ async function handleRouteMove(message, sender) {
     }
     if (destination?.completionId === completionId) {
       if (!destination.notified) {
-        destination.documentId = String(sender?.documentId || destination.documentId);
-        destination.routeEpoch = Math.max(0, Math.trunc(Number(message.routeEpoch) || 0));
+        const incomingDocumentId = String(sender?.documentId || destination.documentId);
+        const differentDocument = Boolean(destination.documentId && incomingDocumentId
+          && destination.documentId !== incomingDocumentId);
+        destination.documentId = incomingDocumentId;
+        const incomingRouteEpoch = Math.max(0, Math.trunc(Number(message.routeEpoch) || 0));
+        destination.routeEpoch = differentDocument
+          ? incomingRouteEpoch
+          : Math.max(destination.routeEpoch, incomingRouteEpoch);
+        destination.documentClaimAt = Math.max(destination.documentClaimAt, Number(message.at) || Date.now());
         destination.suspended = false;
+        destination.suspendedAt = 0;
         destination.lastActivityAt = Math.max(destination.lastActivityAt, Date.now());
         store[toKey] = destination;
       }
@@ -1447,7 +1622,9 @@ async function handleRouteMove(message, sender) {
       prior.pathHash = toPathHash;
       prior.documentId = String(sender?.documentId || prior.documentId);
       prior.routeEpoch = Math.max(0, Math.trunc(Number(message.routeEpoch) || 0));
+      prior.documentClaimAt = Math.max(prior.documentClaimAt, Number(message.at) || Date.now());
       prior.suspended = false;
+      prior.suspendedAt = 0;
       prior.lastActivityAt = Date.now();
       delete store[fromKey];
       store[toKey] = prior;
@@ -1484,7 +1661,7 @@ async function handleRouteSuspend(message, sender) {
       return { state, action: { type: 'suppress', reason: 'stale-route-epoch' } };
     }
     state.suspended = true;
-    state.lastActivityAt = Date.now();
+    state.suspendedAt = Number(message.at) || Date.now();
     return { state, action: { type: 'suspended' } };
   });
   await refreshWatchdogAlarm();
@@ -1532,7 +1709,12 @@ async function handleDomCandidate(message, sender) {
   }, sender);
 
   if (result.action.type !== 'notify') {
-    return { ok: true, suppressed: true, reason: result.action.reason || 'not-final' };
+    return {
+      ok: true,
+      suppressed: true,
+      reason: result.action.reason || 'not-final',
+      notificationStatus: 'suppressed',
+    };
   }
   let response;
   try {

@@ -38,7 +38,10 @@
       lastActivityAt: Math.max(0, finite(raw.lastActivityAt, 0)),
       phase: String(raw.phase || 'waiting'),
       sawGenerating: Boolean(raw.sawGenerating),
+      sawGeneratingWithoutFinalAction: Boolean(raw.sawGeneratingWithoutFinalAction),
       suspended: Boolean(raw.suspended),
+      suspendedAt: Math.max(0, finite(raw.suspendedAt, 0)),
+      documentClaimAt: Math.max(0, finite(raw.documentClaimAt, 0)),
       expiresAt: Math.max(0, finite(raw.expiresAt, 0)),
       notified,
       notifiedAt: Math.max(0, finite(raw.notifiedAt, 0)),
@@ -68,7 +71,10 @@
       lastActivityAt: at,
       phase: 'waiting',
       sawGenerating: false,
+      sawGeneratingWithoutFinalAction: false,
       suspended: false,
+      suspendedAt: 0,
+      documentClaimAt: at,
       expiresAt: Math.max(at, finite(event.expiresAt, at + 24 * 60 * 60 * 1_000)),
       notified: false,
       notifiedAt: 0,
@@ -84,9 +90,12 @@
     const completionId = String(event.completionId || '');
     if (state && completionId && state.completionId === completionId) {
       if (state.notified) return { state, action: { type: 'noop', reason: 'already-notified' } };
-      state.documentId = String(event.documentId || state.documentId);
+      const incomingDocumentId = String(event.documentId || state.documentId);
+      const differentDocument = Boolean(state.documentId && incomingDocumentId && state.documentId !== incomingDocumentId);
+      state.documentId = incomingDocumentId;
       state.pathHash = String(event.pathHash || state.pathHash);
-      state.routeEpoch = Math.max(state.routeEpoch, Math.trunc(finite(event.routeEpoch, state.routeEpoch)));
+      const incomingRouteEpoch = Math.max(0, Math.trunc(finite(event.routeEpoch, state.routeEpoch)));
+      state.routeEpoch = differentDocument ? incomingRouteEpoch : Math.max(state.routeEpoch, incomingRouteEpoch);
       state.startSource = state.startSource === 'explicit' || normalizeSource(event.source) === 'explicit'
         ? 'explicit'
         : 'implicit';
@@ -99,6 +108,8 @@
       state.lastActivityAt = Math.max(state.lastActivityAt, Math.max(0, finite(event.at, Date.now())));
       state.tabHidden = event.tabHidden === true || state.tabHidden;
       state.suspended = false;
+      state.suspendedAt = 0;
+      state.documentClaimAt = Math.max(state.documentClaimAt, Math.max(0, finite(event.at, Date.now())));
       return { state, action: { type: 'update', reason: 'same-completion' } };
     }
     return { state: newState(state, { ...event, completionId }), action: { type: 'new-turn' } };
@@ -122,8 +133,10 @@
     if (state.routeEpoch && Math.trunc(finite(event.routeEpoch, 0)) !== state.routeEpoch) {
       return { state, action: { type: 'suppress', reason: 'stale-route-epoch' } };
     }
-    if (state.suspended) return { state, action: { type: 'suppress', reason: 'route-suspended' } };
     const candidateAt = Math.max(0, finite(event.at, Date.now()));
+    if (state.suspended && (!state.suspendedAt || candidateAt > state.suspendedAt)) {
+      return { state, action: { type: 'suppress', reason: 'route-suspended' } };
+    }
     if (state.expiresAt && state.expiresAt <= candidateAt) {
       return { state, action: { type: 'suppress', reason: 'expired-turn' } };
     }
@@ -155,7 +168,7 @@
           source: trustedActionlessFinal ? 'dom-fast-final' : 'dom-final',
           cycleNumber: state.cycleNumber,
           startedAt: state.startedAt,
-          completedAt: Math.max(state.lastActivityAt, candidateAt),
+          completedAt: candidateAt,
           completionId: state.completionId,
           reason: 'notification-pending',
         },
@@ -168,9 +181,10 @@
     const at = Math.max(state.lastActivityAt, candidateAt);
     state.lastActivityAt = at;
     state.notified = true;
-    state.notifiedAt = at;
+    state.notifiedAt = candidateAt;
     state.phase = 'complete';
     state.suspended = false;
+    state.suspendedAt = 0;
     state.notificationStatus = 'pending';
     state.notificationRetryAt = 0;
     state.notificationAttempts = 0;
@@ -182,7 +196,7 @@
         source: trustedActionlessFinal ? 'dom-fast-final' : 'dom-final',
         cycleNumber: state.cycleNumber,
         startedAt: state.startedAt,
-        completedAt: at,
+        completedAt: candidateAt,
         completionId: state.completionId,
       },
     };

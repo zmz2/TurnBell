@@ -140,9 +140,9 @@ test('hydrated history stays silent, then regular and Instant Enter-sent turns e
   assert.equal(sampleScheduleCalls.at(-1), 0);
   await flushEffects();
 
-  async function sampleNow() {
+  async function sampleNow(message = { type: 'monitor-sample-now' }) {
     const response = await new Promise((resolve) => {
-      runtimeListener({ type: 'monitor-sample-now' }, {}, resolve);
+      runtimeListener(message, {}, resolve);
     });
     await flushEffects();
     return response;
@@ -246,11 +246,20 @@ test('hydrated history stays silent, then regular and Instant Enter-sent turns e
     isComposing: false, keyCode: 13, target: composer,
   });
   await flushEffects();
-  const switchedCompletionId = runtimeMessages
+  const switchedTurn = runtimeMessages
     .filter((message) => message.type === 'turn-start')
-    .at(-1).completionId;
+    .at(-1);
+  const switchedCompletionId = switchedTurn.completionId;
   context.location.pathname = '/c/another-task';
-  await sampleNow();
+  const staleRouteSample = await sampleNow({
+    type: 'monitor-sample-now',
+    pathHash: switchedTurn.pathHash,
+    routeEpoch: switchedTurn.routeEpoch,
+    completionId: switchedCompletionId,
+  });
+  assert.equal(staleRouteSample.stale, true);
+  assert.equal(staleRouteSample.reason, 'route-not-mounted');
+  assert.equal(staleRouteSample.sampled, undefined);
   assert.equal(runtimeMessages.some((message) => message.type === 'turn-move'), false);
   assert.equal(runtimeMessages.some((message) => (
     message.type === 'turn-suspend'

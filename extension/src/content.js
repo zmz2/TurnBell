@@ -792,7 +792,20 @@
         const expectedPathHash = String(message.pathHash || '');
         const expectedEpoch = Number(message.routeEpoch);
         const expectedCompletionId = String(message.completionId || '');
-        void routeHash(currentPath).then((activePathHash) => {
+        const observedPath = routePath();
+        if (observedPath !== currentPath) {
+          // Reconcile the SPA transition, but never report an old route's ping
+          // as a successful sample of the newly mounted conversation.
+          sample();
+          sendResponse({ ok: true, stale: true, reason: 'route-not-mounted' });
+          return true;
+        }
+        void routeHash(observedPath).then((activePathHash) => {
+          if (observedPath !== routePath() || observedPath !== currentPath) {
+            sample();
+            sendResponse({ ok: true, stale: true, reason: 'route-not-mounted' });
+            return;
+          }
           if (
             (expectedPathHash && activePathHash !== expectedPathHash)
             || (Number.isInteger(expectedEpoch) && expectedEpoch !== routeEpoch)

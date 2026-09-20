@@ -55,7 +55,7 @@
   }
 
   function createDetector(rawOptions = {}) {
-    const options = normalizeOptions(rawOptions);
+    let options = normalizeOptions(rawOptions);
     let state;
 
     function initialState() {
@@ -69,6 +69,7 @@
         lastIsGenerating: false,
         cycleStartAt: null,
         baselineAssistantText: '',
+        baselineAssistantCount: 0,
         lastAssistantChangeAt: null,
         settleStartedAt: null,
         sawGenerating: false,
@@ -94,6 +95,7 @@
       state.phase = isGenerating ? 'generating' : 'waiting';
       state.cycleStartAt = now;
       state.baselineAssistantText = baseline;
+      state.baselineAssistantCount = state.lastAssistantCount;
       state.lastAssistantChangeAt = null;
       state.settleStartedAt = null;
       state.sawGenerating = Boolean(isGenerating);
@@ -165,7 +167,8 @@
         state.settleStartedAt = null;
       }
 
-      if (state.phase !== 'idle' && assistantTextChanged) {
+      const assistantChanged = assistantTextChanged || assistantTurnAdded;
+      if (state.phase !== 'idle' && assistantChanged) {
         state.lastAssistantChangeAt = snapshot.now;
         if (!snapshot.isGenerating && state.phase === 'waiting') {
           state.phase = 'settling';
@@ -188,7 +191,7 @@
 
       // Never complete on the exact mutation that changed the reply. Requiring
       // one stable sample makes the quiet-period contract deterministic.
-      if (assistantTextChanged && state.phase === 'settling') {
+      if (assistantChanged && state.phase === 'settling') {
         remember(snapshot);
         return null;
       }
@@ -213,7 +216,8 @@
         const actionlessQuietEnough = stableDurationMs >= options.actionlessQuietPeriodMs;
         const durationMs = Math.max(0, snapshot.now - (state.cycleStartAt ?? snapshot.now));
         const longEnough = durationMs >= options.minGenerationMs;
-        const replyChanged = snapshot.assistantText !== state.baselineAssistantText;
+        const replyChanged = snapshot.assistantText !== state.baselineAssistantText
+          || snapshot.assistantCount > state.baselineAssistantCount;
         const hasReply = snapshot.assistantText.trim().length > 0;
 
         if (quietEnough && longEnough) {
@@ -262,8 +266,8 @@
         state.initialized = true;
         remember(snapshot);
       }
-      beginCycle(snapshot.now, snapshot.assistantText, snapshot.isGenerating, 'explicit');
       remember(snapshot);
+      beginCycle(snapshot.now, snapshot.assistantText, snapshot.isGenerating, 'explicit');
       return getState();
     }
 
@@ -275,7 +279,11 @@
       state = initialState();
     }
 
-    return Object.freeze({ step, arm, getState, reset });
+    function updateOptions(raw = {}) {
+      options = normalizeOptions(raw);
+    }
+
+    return Object.freeze({ step, arm, getState, reset, updateOptions });
   }
 
   return Object.freeze({ createDetector, fingerprint, normalizeOptions });

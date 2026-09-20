@@ -35,6 +35,34 @@ function detector(overrides = {}) {
   });
 }
 
+for (const generating of [false, true]) {
+  test(`identical text in a new reply notifies once (generating=${generating})`, () => {
+    const d = detector();
+    const old = { assistantText: 'I am ChatGPT', assistantCount: 1, userCount: 1, allowImplicitStart: false };
+    d.step(snapshot({ ...old, now: 0 }));
+    d.arm(snapshot({ ...old, now: 100 }));
+    if (generating) d.step(snapshot({ ...old, now: 150, isGenerating: true }));
+    const next = { ...old, assistantCount: 2, userCount: 2 };
+    assert.equal(d.step(snapshot({ ...next, now: 200 })), null);
+    assert.equal(d.step(snapshot({ ...next, now: 999 })), null);
+    assert.equal(d.step(snapshot({ ...next, now: 1000 }))?.type, 'complete');
+    assert.equal(d.step(snapshot({ ...next, now: 2000 })), null);
+  });
+}
+
+test('changing options preserves the active cycle and reply baseline', () => {
+  const d = detector();
+  d.step(snapshot({ now: 0, assistantText: 'old' }));
+  d.arm(snapshot({ now: 100, assistantText: 'old' }));
+  d.step(snapshot({ now: 200, assistantText: 'new' }));
+  const before = d.getState();
+  d.updateOptions({ quietPeriodMs: 900, minGenerationMs: 0 });
+  const after = d.getState();
+  assert.deepEqual({ ...after, options: null }, { ...before, options: null });
+  assert.equal(d.step(snapshot({ now: 1099, assistantText: 'new' })), null);
+  assert.equal(d.step(snapshot({ now: 1100, assistantText: 'new' }))?.type, 'complete');
+});
+
 test('initial historical conversation does not emit a completion', () => {
   const d = detector();
 

@@ -17,10 +17,12 @@ function makeTurn(text, identity) {
   return { text, identity, container: { identity } };
 }
 
-test('hydrated history stays silent, then regular and Instant Enter-sent turns each emit one final candidate', async () => {
+for (const settingsChange of [false, true]) {
+test(`history stays silent and regular/Instant replies notify with settings change=${settingsChange}`, async () => {
   let now = 0;
   let runtimeListener = null;
   let observer = null;
+  let storageListener = null;
   const documentListeners = new Map();
   const runtimeMessages = [];
   const page = {
@@ -111,7 +113,7 @@ test('hydrated history stays silent, then regular and Instant Enter-sent turns e
     },
     storage: {
       sync: { get(defaults, callback) { callback(defaults); } },
-      onChanged: { addListener() {} },
+      onChanged: { addListener(listener) { storageListener = listener; } },
     },
   };
   context.globalThis = context;
@@ -160,6 +162,7 @@ test('hydrated history stays silent, then regular and Instant Enter-sent turns e
   runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
 
   now = 4_300;
+  if (settingsChange) storageListener({ sound: { newValue: false } }, 'sync');
   runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
   now = 5_000;
   runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
@@ -205,3 +208,4 @@ test('hydrated history stays silent, then regular and Instant Enter-sent turns e
   assert.equal(candidates[1].payload.event.finalEvidence, 'explicit-fast-stable');
   assert.equal(JSON.stringify(candidates[1]).includes('instant final answer'), false);
 });
+}

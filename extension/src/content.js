@@ -454,7 +454,7 @@
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     switch (message?.type) {
       case 'monitor-ping':
-        sendResponse({ ok: true, active: true, version: '1.5.1', mode: 'dom-only' });
+        sendResponse({ ok: true, active: true, version: '1.5.2', mode: 'dom-only' });
         return false;
       case 'monitor-sample-now': {
         const state = detector.getState();
@@ -481,10 +481,9 @@
     const next = { ...settings };
     for (const [key, change] of Object.entries(changes)) next[key] = change.newValue;
     settings = notificationAPI.normalizeSettings(next);
-    const snapshot = snapshotForCycle();
-    detector = detectorAPI.createDetector(settings);
-    if (bootstrapGate.getState().ready) detector.step(snapshot);
-    lastDetectorCycle = detector.getState().cycleNumber;
+    // Popup saves (including a notification test) must not discard the active
+    // reply or its baseline. Update timing options without restarting the cycle.
+    detector.updateOptions(settings);
     lastSettleKey = '';
     scheduleSample(0);
     log('settings updated', settings);

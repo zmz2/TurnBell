@@ -16,7 +16,7 @@ test('manifest is a local-code Manifest V3 extension for ChatGPT', () => {
 
   assert.equal(manifest.manifest_version, 3);
   assert.equal(manifest.minimum_chrome_version, '111');
-  assert.equal(manifest.version, '1.5.1');
+  assert.equal(manifest.version, '1.5.2');
   assert.equal(manifest.background.service_worker, 'src/background.js');
   assert.equal(manifest.action.default_popup, 'popup.html');
   assert.ok(manifest.permissions.includes('notifications'));

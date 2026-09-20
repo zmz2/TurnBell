@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "TurnBell · AI 对话完成提醒",
   "short_name": "TurnBell",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "description": "本地、隐私优先：忽略刷新加载的历史对话，并兼容 ChatGPT Instant/极速回复完成提醒；无需 EXE。",
   "minimum_chrome_version": "111",
   "permissions": [

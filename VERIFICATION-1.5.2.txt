@@ -1,0 +1,23 @@
+TurnBell 1.5.2 Verification Record
+Date: 2026-09-20
+
+Scope
+- Based on 1.5.1, retaining its lock/unlock notification replay.
+- Settings changes preserve the active detector cycle and baseline.
+- A newly added assistant reply can complete even with identical text.
+- No browser automation or Windows settings changes were used for this patch.
+
+Source verification
+- node --test extension/tests/*.test.js: PASS, 86 tests.
+- node --check on every extension JavaScript file: PASS.
+- New regression tests against 1.5.1: four expected failures.
+- python -m unittest discover -s scripts/tests -v: PASS, 4 tests.
+- git diff --check: PASS.
+
+Real-device scope
+- Read-only inspection found Edge loading an unpacked 1.5.0 download directory.
+- Manual test toast success is user-reported, not independently observed.
+- Automated tests cover DOM lifecycle and notification APIs using test doubles.
+- Actual ChatGPT completion to Windows toast and lock/unlock presentation have
+  not been verified on the user's current Edge session.
+- Reload the unpacked extension and refresh ChatGPT after updating files.

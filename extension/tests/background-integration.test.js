@@ -366,7 +366,7 @@ test('Web Notification compatibility backend bypasses chrome.notifications routi
   assert.equal(h.webNotifications[0].options.requireInteraction, true);
 });
 
-test('a completion delivered while locked is recreated once after unlock without saving conversation content', async () => {
+test('unlock replays the original notification title and message without saving reply text', async () => {
   const h = createHarness({ sound: false }, { idleState: 'locked' });
   await h.sendRuntimeMessage({ type: 'turn-start', turnKey: 'turn-locked', userCount: 1, at: 10_000 });
   const response = await h.sendRuntimeMessage(domCandidate('turn-locked'));
@@ -379,7 +379,10 @@ test('a completion delivered while locked is recreated once after unlock without
   assert.equal(queued[0].tabId, 42);
   assert.equal(queued[0].notificationId, h.notifications[0].id);
   assert.equal(Object.hasOwn(queued[0], 'pageTitle'), false);
-  assert.equal(Object.hasOwn(queued[0], 'url'), false);
+  assert.equal(queued[0].url, 'https://chatgpt.com/c/background');
+  assert.equal(queued[0].title, h.notifications[0].options.title);
+  assert.equal(queued[0].message, h.notifications[0].options.message);
+  assert.equal(JSON.stringify(queued).includes('must never enter a notification'), false);
   assert.equal(Object.hasOwn(queued[0], 'fingerprint'), false);
   assert.equal(Object.hasOwn(queued[0], 'replyText'), false);
 
@@ -388,7 +391,8 @@ test('a completion delivered while locked is recreated once after unlock without
 
   assert.equal(h.notifications.length, 2);
   assert.equal(h.notifications[1].id, h.notifications[0].id);
-  assert.equal(h.notifications[1].options.message, '锁屏期间有一轮回复完成');
+  assert.equal(h.notifications[1].options.title, h.notifications[0].options.title);
+  assert.equal(h.notifications[1].options.message, h.notifications[0].options.message);
   assert.equal(h.sessionStore.turnbellLockedReplayQueueV1.length, 0);
 });
 
@@ -397,6 +401,7 @@ test('unlock recreates a locked Web Notification using the same tag', async () =
   await h.sendRuntimeMessage({ type: 'turn-start', turnKey: 'turn-web-locked', userCount: 1, at: 10_000 });
   const response = await h.sendRuntimeMessage(domCandidate('turn-web-locked'));
   const initialTag = h.webNotifications[0].options.tag;
+  const initialNotification = h.webNotifications[0];
 
   assert.equal(response.routes.web, true);
   assert.equal(h.webNotifications.length, 1);
@@ -407,7 +412,9 @@ test('unlock recreates a locked Web Notification using the same tag', async () =
 
   assert.equal(h.webNotifications.length, 1);
   assert.equal(h.webNotifications[0].options.tag, initialTag);
-  assert.equal(h.webNotifications[0].options.body, '锁屏期间有一轮回复完成');
+  assert.equal(h.webNotifications[0].title, initialNotification.title);
+  assert.equal(h.webNotifications[0].options.body, initialNotification.options.body);
+  assert.equal(h.webNotifications[0].options.data.url, initialNotification.options.data.url);
   assert.equal(h.sessionStore.turnbellLockedReplayQueueV1.length, 0);
 });
 
@@ -418,6 +425,21 @@ test('unlock racing the initial notification still produces only one replay', as
   await h.sendRuntimeMessage(domCandidate('turn-unlock-race'));
   await h.flush();
 
+  assert.equal(h.notifications.length, 2);
+  assert.equal(h.notifications[1].options.message, h.notifications[0].options.message);
+  assert.equal(h.sessionStore.turnbellLockedReplayQueueV1.length, 0);
+});
+
+test('legacy queued entries without display snapshots still replay', async () => {
+  const h = createHarness({ sound: false }, { idleState: 'locked' });
+  await h.sendRuntimeMessage({ type: 'turn-start', turnKey: 'legacy', at: 10_000 });
+  await h.sendRuntimeMessage(domCandidate('legacy'));
+  const item = h.sessionStore.turnbellLockedReplayQueueV1[0];
+  delete item.title;
+  delete item.message;
+  delete item.url;
+  h.setIdleState('active');
+  await h.flush();
   assert.equal(h.notifications.length, 2);
   assert.equal(h.notifications[1].options.message, '锁屏期间有一轮回复完成');
   assert.equal(h.sessionStore.turnbellLockedReplayQueueV1.length, 0);

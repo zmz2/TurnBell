@@ -1,0 +1,11 @@
+TurnBell 1.5.3 Verification Record
+Date: 2026-09-20
+
+Scope
+- Unlock replays preserve the original notification title, message and URL.
+- Queue contains formatted display text (including conversation name), not reply text.
+- Legacy entries without display fields retain a generic fallback.
+- Automated coverage checks Chrome and Web routes, unlock races and legacy entries.
+- No browser automation was performed. Windows visual presentation was not tested.
+
+Validation: 87 JavaScript tests and 4 packaging tests passed; background syntax and git diff checks passed.

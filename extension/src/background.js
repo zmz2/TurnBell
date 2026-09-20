@@ -102,7 +102,7 @@ function queryIdleState() {
   });
 }
 
-function createLockReplayEntry(tabId, completedAt, durationMs) {
+function createLockReplayEntry(tabId, completedAt, payload) {
   const tabPart = Number.isInteger(tabId) ? tabId : 'unknown';
   const token = `${Math.max(0, Math.trunc(Number(completedAt) || Date.now())).toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   const id = `${tabPart}-${token}`;
@@ -111,7 +111,11 @@ function createLockReplayEntry(tabId, completedAt, durationMs) {
     id,
     tabId: Number.isInteger(tabId) ? tabId : null,
     completedAt: Math.max(0, Number(completedAt) || now),
-    durationMs: Math.max(0, Number(durationMs) || 0),
+    durationMs: Math.max(0, Number(payload.durationMs) || 0),
+    // Retain only the already-formatted notification, never the reply body.
+    title: payload.title,
+    message: payload.message,
+    url: notificationAPI.safeChatGPTUrl(payload.url),
     notificationId: `${NOTIFICATION_PREFIX}${tabPart}-unlock-${token}`,
     webTag: `turnbell-lock-${tabPart}-${token}`,
     status: 'initializing',
@@ -489,10 +493,12 @@ async function performLockedReplayFlush() {
       }, {
         tabId: item.tabId,
         pageTitle: 'ChatGPT',
-        url: 'https://chatgpt.com/',
+        url: notificationAPI.safeChatGPTUrl(item.url),
         tabHidden: true,
       });
-      payload.message = '锁屏期间有一轮回复完成';
+      // Older queued entries have no display snapshot; keep their fallback.
+      payload.title = item.title || payload.title;
+      payload.message = item.message || '锁屏期间有一轮回复完成';
       payload.notificationId = item.notificationId;
       payload.webTag = item.webTag;
       payload.lockReplayId = item.id;
@@ -598,7 +604,7 @@ async function notifyFromFinal(tabId, action, event = {}, rawContext = {}, force
 
   let lockReplay = null;
   if (await queryIdleState() === 'locked') {
-    lockReplay = createLockReplayEntry(tabId, completedAt, payload.durationMs);
+    lockReplay = createLockReplayEntry(tabId, completedAt, payload);
     lockInitialNotificationsInFlight.add(lockReplay.id);
     try {
       await enqueueLockReplay(lockReplay);

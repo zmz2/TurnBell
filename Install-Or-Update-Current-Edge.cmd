@@ -29,7 +29,7 @@ if %RC% GEQ 8 (
 )
 
 echo.
-echo TurnBell 1.5.2 已复制到：
+echo TurnBell 1.5.3 已复制到：
 echo %TARGET%
 echo.
 echo 已安装旧版：请在扩展卡片上点击“重新加载”。

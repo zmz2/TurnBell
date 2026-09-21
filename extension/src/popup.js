@@ -26,7 +26,44 @@
   const openNotificationSettings = document.getElementById('openNotificationSettings');
   const saveStatus = document.getElementById('saveStatus');
   const volumeValue = document.getElementById('soundVolumeValue');
+  const platformNotificationHint = document.getElementById('platformNotificationHint');
+  const systemSoundOption = document.getElementById('systemSoundOption');
+  const systemSoundHint = document.getElementById('systemSoundHint');
+  const notificationBackendHint = document.getElementById('notificationBackendHint');
+  const userAgent = String(globalThis.navigator?.userAgent || '');
+  const rawPlatform = String(globalThis.navigator?.userAgentData?.platform
+    || globalThis.navigator?.platform || '').toLowerCase();
+  const platformName = rawPlatform.includes('mac')
+    ? 'macOS'
+    : rawPlatform.includes('win') ? 'Windows' : '当前系统';
+  const soundPlatformName = platformName === '当前系统' ? '操作系统' : platformName;
+  const browserName = /\bEdg\//u.test(userAgent)
+    ? 'Microsoft Edge'
+    : /\bChrome\//u.test(userAgent) ? 'Google Chrome' : '当前浏览器';
   let saveTimer = null;
+
+  function configurePlatformCopy() {
+    systemSoundOption.textContent = platformName === '当前系统'
+      ? '系统默认通知声（推荐）'
+      : `${platformName} 系统默认通知声（推荐）`;
+    systemSoundHint.textContent = `系统默认通知声音由 ${soundPlatformName} 和浏览器控制，请用下方测试通知试听。`;
+    notificationBackendHint.textContent = '推荐使用扩展通知 API；浏览器会按当前操作系统显示原生通知。';
+    platformNotificationHint.textContent = platformName === 'macOS'
+      ? `macOS 使用系统通知中心。若未显示，请在“系统设置 → 通知 → ${browserName}”中允许通知，并检查专注模式。`
+      : platformName === 'Windows'
+        ? `若未显示，请检查 Windows 通知设置及 ${browserName} 的系统通知权限。`
+        : '通知样式和声音由当前操作系统及浏览器的通知设置控制。';
+  }
+
+  function notificationHelp() {
+    if (platformName === 'macOS') {
+      return `请检查 macOS“系统设置 → 通知 → ${browserName}”及专注模式。`;
+    }
+    if (platformName === 'Windows') {
+      return `请检查 Windows 通知设置和 ${browserName} 的通知权限。`;
+    }
+    return '请检查操作系统通知设置和浏览器通知权限。';
+  }
 
   function storageGet(defaults) {
     return new Promise((resolve) => chrome.storage.sync.get(defaults, resolve));
@@ -67,7 +104,7 @@
     elements.soundTheme.disabled = !soundEnabled;
     elements.soundVolume.disabled = !soundEnabled || systemManaged;
     previewSound.disabled = !soundEnabled || systemManaged;
-    previewSound.title = systemManaged ? 'Windows 默认声只能通过系统通知试听' : '试听所选内置音效';
+    previewSound.title = systemManaged ? '系统默认声只能通过系统通知试听' : '试听所选内置音效';
     volumeValue.textContent = systemManaged
       ? '系统控制'
       : `${Math.round(Number(elements.soundVolume.value) * 100)}%`;
@@ -106,27 +143,27 @@
       ? `（${new Date(Number(routes.at)).toLocaleTimeString()}）`
       : '';
     if (routes.web) {
-      const soundNote = routes.systemSound ? ' Windows 默认通知声已交由 Edge/Windows 处理。' : '';
-      return `Web 通知兼容通道已接受通知${routes.webActive ? '并保持活动' : ''}${age}。${soundNote}若仍没有 Windows 横幅或声音，说明 Edge/Windows 在系统层收纳、静音或阻止了通知；插件无法绕过该策略。`;
+      const soundNote = routes.systemSound ? ` ${platformName} 系统默认通知声由操作系统和浏览器控制。` : '';
+      return `Web 通知兼容通道已接受通知${routes.webActive ? '并保持活动' : ''}${age}。${soundNote}${notificationHelp()}`;
     }
     if (routes.webDiagnostic === 'web-unsupported') {
-      return `当前 Edge 不支持 Web 通知兼容通道${age}；请改回“Edge 扩展通知 API”。`;
+      return `当前浏览器不支持 Web 通知兼容通道${age}；请改回“浏览器扩展通知 API”。`;
     }
     if (routes.webDiagnostic === 'web-create-failed') {
       return `Web 通知兼容通道创建失败${age}${routes.webError ? `：${routes.webError}` : '。'}`;
     }
     if (routes.permission === 'denied' || routes.diagnostic === 'permission-denied') {
-      return `Edge 扩展通知权限被拒绝${age}。请重新加载扩展，并检查 Edge/Windows 通知设置。`;
+      return `浏览器扩展通知权限被拒绝${age}。请重新加载扩展，并检查系统通知设置。`;
     }
     if (routes.diagnostic === 'create-failed') {
-      return `Edge 未能创建扩展通知${age}${routes.error ? `：${routes.error}` : '。'}`;
+      return `浏览器未能创建扩展通知${age}${routes.error ? `：${routes.error}` : '。'}`;
     }
     if (routes.browser && routes.browserActive) {
-      const soundNote = routes.systemSound ? 'Windows 默认通知声已交由 Edge/Windows 处理；' : '';
-      return `Edge 扩展通知 API 已接受并保留通知${age}。${soundNote}若没看到横幅或没有系统声，请检查通知中心、Windows 声音设置和 edge://policy 中的 AllowSystemNotifications；这不等同于 Windows 已实际展示或播放。`;
+      const soundNote = routes.systemSound ? `${platformName} 系统默认通知声由操作系统和浏览器控制；` : '';
+      return `浏览器扩展通知 API 已接受通知${age}。${soundNote}${notificationHelp()}`;
     }
     if (routes.browser && !routes.browserActive) {
-      return `Edge 已接受扩展通知，但查询时已不在活动列表${age}。Windows 或 Edge 可能立即收纳了通知。`;
+      return `浏览器已接受扩展通知，但查询时已不在活动列表${age}。操作系统或浏览器可能已收起通知。`;
     }
     if (routes.sound || routes.badge) {
       return `系统通知未成功，但${routes.sound ? '提示音' : ''}${routes.sound && routes.badge ? '和' : ''}${routes.badge ? '工具栏 ✓ 徽标' : ''}已生效${age}。`;
@@ -161,7 +198,7 @@
 
   async function refreshNotificationStatus() {
     refreshStatus.disabled = true;
-    notificationStatus.textContent = '正在检查 Edge 通知权限…';
+    notificationStatus.textContent = '正在检查浏览器通知权限…';
     notificationDot.className = 'dot';
     const [permission, diagnostic] = await Promise.all([
       sendMessage({ type: 'notification-permission' }),
@@ -171,17 +208,17 @@
     if (backend === 'web') {
       if (permission?.ok && permission.webSupported) {
         notificationDot.className = 'dot ok';
-        notificationStatus.textContent = 'Web 通知兼容通道可调用；请用测试按钮验证实际横幅';
+        notificationStatus.textContent = 'Web 通知兼容通道可调用；请用测试按钮验证系统通知';
       } else {
         notificationDot.className = 'dot offline';
-        notificationStatus.textContent = '当前 Edge 不支持 Web 通知兼容通道';
+        notificationStatus.textContent = '当前浏览器不支持 Web 通知兼容通道';
       }
     } else if (permission?.ok && permission.level === 'granted') {
       notificationDot.className = 'dot ok';
-      notificationStatus.textContent = 'Edge 扩展通知 API 已获准；请用测试按钮验证实际横幅';
+      notificationStatus.textContent = '浏览器扩展通知 API 已获准；请用测试按钮验证系统通知';
     } else {
       notificationDot.className = 'dot offline';
-      notificationStatus.textContent = 'Edge 扩展通知权限不可用或被拒绝';
+      notificationStatus.textContent = '浏览器扩展通知权限不可用或被拒绝';
     }
     diagnosticStatus.textContent = formatDiagnostic(diagnostic?.diagnostic || null);
     refreshStatus.disabled = false;
@@ -199,9 +236,9 @@
     } else if (routes?.web) {
       testButton.textContent = '⚠️ 兼容通道已创建，未保持活动';
     } else if (routes?.browser && routes.browserActive) {
-      testButton.textContent = '✅ Edge 已接受通知';
+      testButton.textContent = '✅ 浏览器已接受通知';
     } else if (routes?.browser) {
-      testButton.textContent = '⚠️ Edge 已创建，系统未保留';
+      testButton.textContent = '⚠️ 浏览器已创建，系统未保留';
     } else if (routes?.sound || routes?.badge) {
       testButton.textContent = '⚠️ 系统横幅失败，备用提醒成功';
     } else {
@@ -238,16 +275,17 @@
     }, 900);
   }
 
-  async function openEdgeSettings() {
+  async function openBrowserSettings() {
     openNotificationSettings.disabled = true;
-    const result = await sendMessage({ type: 'open-edge-notification-settings' });
+    const result = await sendMessage({ type: 'open-browser-notification-settings' });
     if (!result?.ok) {
-      diagnosticStatus.textContent = `无法自动打开 Edge 设置${result?.error ? `：${result.error}` : '。请手动打开 edge://policy，并搜索 AllowSystemNotifications。'}`;
+      diagnosticStatus.textContent = `无法自动打开浏览器通知设置${result?.error ? `：${result.error}` : '。'} ${notificationHelp()}`;
     }
     setTimeout(() => { openNotificationSettings.disabled = false; }, 700);
   }
 
   async function initialize() {
+    configurePlatformCopy();
     const stored = await storageGet({});
     const settings = api.migrateSettings(stored);
     await storageSet(settings);
@@ -264,7 +302,7 @@
     testButton.addEventListener('click', () => void testNotification());
     previewSound.addEventListener('click', () => void previewSelectedSound());
     openButton.addEventListener('click', () => void sendMessage({ type: 'open-chatgpt' }));
-    openNotificationSettings.addEventListener('click', () => void openEdgeSettings());
+    openNotificationSettings.addEventListener('click', () => void openBrowserSettings());
     void refreshNotificationStatus();
     void refreshMonitorStatus();
   }

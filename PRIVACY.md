@@ -1,9 +1,9 @@
 # TurnBell 隐私说明
 
-版本：1.5.1
-更新日期：2026-09-19
+版本：1.6.0
+更新日期：2026-09-21
 
-TurnBell 是一个仅在本机运行的 Microsoft Edge / Chromium 浏览器扩展，用于在 ChatGPT 的新一轮回复出现明确最终完成证据后发出提醒。
+TurnBell 是一个仅在本机运行的 Chromium 浏览器扩展，用于在 ChatGPT 的新一轮回复出现明确最终完成证据后发出提醒。系统通知由当前浏览器转交操作系统处理；Chrome on macOS 使用 macOS 原生通知系统。
 
 ## 页面内处理的数据
 
@@ -37,7 +37,7 @@ TurnBell 使用浏览器扩展存储保存：
 - 总开关；
 - 通知通道选择；
 - 提示音、音效主题和音量；
-- 一次性声音行为迁移版本，用于把旧版默认内置音效切换为 Windows 默认通知声；
+- 一次性声音行为迁移版本，用于把旧版默认内置音效切换为系统默认通知声；
 - 是否保留通知；
 - 是否仅后台提醒；
 - 静默确认时间和最短生成时间；
@@ -48,11 +48,11 @@ TurnBell 使用浏览器扩展存储保存：
 
 ## 权限用途
 
-- `notifications`：创建 Edge 扩展通知。
+- `notifications`：通过浏览器扩展通知 API 请求系统通知。
 - `storage`：保存设置和短期状态。
-- `offscreen`：仅在用户主动选择自定义音效时播放扩展包内的本地 WAV；Windows 默认通知声不使用离屏音频。
+- `offscreen`：仅在用户主动选择自定义音效时播放扩展包内的本地 WAV；系统默认通知声不使用离屏音频。
 - `scripting`：给更新前已打开的 ChatGPT 标签页补注入同一组本地内容脚本。
-- `idle`：判断 Windows 是否锁屏，以及是否已解锁；TurnBell 不记录应用使用时间或空闲历史。
+- `idle`：读取系统空闲/锁屏状态，以便在恢复活动后补发通知；TurnBell 不记录应用使用时间或空闲历史。
 
 站点权限仅限：
 
@@ -63,7 +63,7 @@ https://chat.openai.com/*
 
 ## 明确不做的事情
 
-TurnBell 1.5.1：
+TurnBell 1.6.0：
 
 - 不读取或修改 Cookie、令牌、密码和账户凭据；
 - 不拦截、克隆或解析 ChatGPT 网络响应流；
@@ -81,9 +81,9 @@ TurnBell 1.5.1：
 1. 官方 `chrome.notifications` 扩展通道；
 2. 扩展 Service Worker 的 Web Notification 兼容通道。
 
-两种方式都在本地执行。Edge 接受通知请求并不保证 Windows 一定显示横幅；Windows“请勿打扰”、通知设置、Edge `AllowSystemNotifications` 策略或 Edge 内置消息中心均可能改变展示方式。
+两种方式都在本地执行。在 macOS 上，Chrome 的扩展通知 API 会使用 macOS 原生通知系统；是否显示横幅和声音仍受操作系统的通知、专注模式及浏览器设置控制。Windows 上的展示会受 Windows 通知设置、Edge `AllowSystemNotifications` 策略或 Edge 内置消息中心影响。浏览器接受通知请求不保证操作系统一定显示横幅。
 
-选择“Windows 默认通知声”时，TurnBell 不播放或读取任何系统声音文件，只把通知标记为非静音，由 Edge/Windows 使用系统当前配置。选择自定义音效时，只加载扩展包内对应的本地 WAV。
+选择“系统默认通知声”时，TurnBell 不播放或读取任何系统声音文件，只把通知标记为非静音，由浏览器和操作系统使用系统当前配置。选择自定义音效时，只加载扩展包内对应的本地 WAV。
 
 ## 保留时间
 

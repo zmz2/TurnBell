@@ -16,7 +16,7 @@ test('popup exposes DOM-only diagnostics, sound choices, and notification troubl
   assert.match(html, /DOM/u);
   assert.match(html, /最多提醒一次/u);
   assert.match(html, /id=["']soundTheme["']/u);
-  assert.match(html, /Windows 默认通知声/u);
+  assert.match(html, /系统默认通知声/u);
   assert.match(html, /id=["']previewSound["']/u);
   assert.match(html, /id=["']notificationBackend["']/u);
   assert.match(html, /Web 通知兼容通道/u);
@@ -24,6 +24,6 @@ test('popup exposes DOM-only diagnostics, sound choices, and notification troubl
   assert.match(html, /id=["']openNotificationSettings["']/u);
   assert.doesNotMatch(html, /最终流|网络请求|Windows\s*助手/u);
   assert.match(script, /preview-sound/u);
-  assert.match(script, /open-edge-notification-settings/u);
+  assert.match(script, /open-browser-notification-settings/u);
   assert.match(script, /browserActive|webActive|diagnostic/u);
 });

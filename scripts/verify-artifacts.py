@@ -118,6 +118,36 @@ def verify_release_zip(path: Path, version: str, extension_members: dict[str, by
             raise ValueError(f"release extension differs from standalone extension: {name}")
 
 
+def verify_macos_release_zip(path: Path, version: str, extension_members: dict[str, bytes]) -> None:
+    prefix = f"TurnBell-{version}-macOS/"
+    required = {
+        prefix + "INSTALL-MACOS.md",
+        prefix + "CHANGELOG.md",
+        prefix + "PRIVACY.md",
+        prefix + "THIRD_PARTY_NOTICES.md",
+        prefix + "LICENSE",
+        prefix + f"VERIFICATION-{version}.txt",
+        prefix + "VERSION.txt",
+        prefix + "extension/manifest.json",
+    }
+    with zipfile.ZipFile(path) as archive:
+        members = safe_members(archive)
+    missing = required - set(members)
+    if missing:
+        raise ValueError(f"macOS release ZIP missing files: {sorted(missing)}")
+    if any(not name.startswith(prefix) for name in members):
+        raise ValueError("macOS release ZIP contains files outside its top-level directory")
+    if any(name.lower().endswith((".exe", ".cmd", ".msi")) for name in members):
+        raise ValueError("macOS release ZIP contains a Windows-only executable or script")
+    if any("extension/tests/" in name for name in members):
+        raise ValueError("macOS release ZIP contains extension tests")
+    assert_extension_manifest(members[prefix + "extension/manifest.json"], version)
+    for name, data in extension_members.items():
+        release_name = prefix + "extension/" + name
+        if members.get(release_name) != data:
+            raise ValueError(f"macOS release extension differs from standalone extension: {name}")
+
+
 def verify_project_zip(path: Path, version: str) -> None:
     prefix = f"TurnBell-{version}-project/"
     required = {
@@ -159,13 +189,15 @@ def verify_all(root: Path, version: str) -> None:
     dist = root / "dist"
     extension = dist / f"TurnBell-{version}-extension.zip"
     release = dist / f"TurnBell-{version}-Edge-Only.zip"
+    macos = dist / f"TurnBell-{version}-macOS.zip"
     project = dist / f"TurnBell-{version}-project.zip"
     checksums = dist / "SHA256SUMS.txt"
-    for path in (extension, release, project, checksums):
+    for path in (extension, release, macos, project, checksums):
         if not path.is_file():
             raise ValueError(f"missing artifact: {path}")
     extension_members = verify_extension_zip(extension, version)
     verify_release_zip(release, version, extension_members)
+    verify_macos_release_zip(macos, version, extension_members)
     verify_project_zip(project, version)
     verify_checksums(checksums, dist)
 

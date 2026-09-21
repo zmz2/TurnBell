@@ -7,11 +7,12 @@ TurnBell is an independent open-source project.
 - OpenAI, ChatGPT, and GPT are trademarks or registered trademarks of OpenAI.
 - Microsoft, Windows, and Microsoft Edge are trademarks or registered trademarks of Microsoft.
 - Google and Google Chrome are trademarks or registered trademarks of Google LLC.
+- Apple, macOS, and Notification Center are trademarks or registered trademarks of Apple Inc.
 - Other product names and logos that may appear incidentally in documentation screenshots belong to their respective owners.
 
 These names are used only to identify compatibility, the tested environment, or the interface shown in installation instructions. Their use does not imply affiliation, endorsement, sponsorship, certification, or partnership.
 
-TurnBell does not use the OpenAI or Microsoft logos as its own product identity.
+TurnBell does not use third-party company logos as its own product identity.
 
 ## Documentation screenshots
 
@@ -35,4 +36,4 @@ The TurnBell application icon and the following bundled WAV files were created s
 
 ## Dependencies
 
-TurnBell 1.5.0 has no third-party JavaScript runtime dependencies and does not load remote JavaScript.
+TurnBell 1.6.0 has no third-party JavaScript runtime dependencies and does not load remote JavaScript.

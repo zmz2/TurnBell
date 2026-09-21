@@ -107,7 +107,7 @@ test('notification backend can use the extension API, Web Notification API, or b
 });
 
 
-test('Windows default sound is the default while custom themes mute the system notification', () => {
+test('system default sound is the default while custom themes mute the system notification', () => {
   const system = normalizeSettings({ sound: true, soundTheme: 'system' });
   const custom = normalizeSettings({ sound: true, soundTheme: 'glass' });
   const muted = normalizeSettings({ sound: false, soundTheme: 'system' });
@@ -120,7 +120,7 @@ test('Windows default sound is the default while custom themes mute the system n
   assert.equal(shouldPlayCustomSound(muted), false);
 });
 
-test('legacy bundled-sound settings migrate once to the Windows default sound', () => {
+test('legacy bundled-sound settings migrate once to the system default sound', () => {
   const migrated = migrateSettings({
     sound: true,
     soundTheme: 'soft-chime',

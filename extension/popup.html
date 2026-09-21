@@ -27,10 +27,11 @@
       </div>
       <div class="status-row">
         <span id="notificationDot" class="dot"></span>
-        <span id="notificationStatus">正在检查 Edge 通知权限…</span>
+        <span id="notificationStatus">正在检查浏览器通知权限…</span>
         <button id="refreshStatus" class="link-button" type="button">刷新</button>
       </div>
-      <p id="diagnosticStatus" class="profile-note">点击“测试系统通知”，这里会显示 Edge 是否真正接受了通知。</p>
+      <p id="platformNotificationHint" class="profile-note"></p>
+      <p id="diagnosticStatus" class="profile-note">点击测试按钮，确认浏览器是否接受了系统通知。</p>
     </section>
 
     <section class="settings">
@@ -42,16 +43,16 @@
       <label class="field">
         <span>系统通知通道</span>
         <select id="notificationBackend" aria-label="系统通知通道">
-          <option value="extension">Edge 扩展通知 API（官方通道）</option>
+          <option value="extension">浏览器扩展通知 API（推荐）</option>
           <option value="web">Web 通知兼容通道（实验）</option>
         </select>
-        <small>Windows 没有显示 Edge 通知时，可切换到兼容通道后重新测试；两种方式都受 Edge 和 Windows 策略控制。</small>
+        <small id="notificationBackendHint">推荐使用扩展通知 API；浏览器会按当前操作系统显示原生通知。</small>
       </label>
 
       <label class="row">
         <span>
           <strong>提示音</strong>
-          <small>默认跟随 Windows/Edge 通知声；也可改用扩展内置音效</small>
+          <small>默认跟随系统通知声；也可改用扩展内置音效</small>
         </span>
         <input id="sound" type="checkbox">
       </label>
@@ -60,7 +61,7 @@
         <span>提示音样式</span>
         <div class="inline-controls">
           <select id="soundTheme" aria-label="提示音样式">
-            <option value="system">Windows 默认通知声（推荐）</option>
+            <option id="systemSoundOption" value="system">系统默认通知声（推荐）</option>
             <option value="soft-chime">柔和双音</option>
             <option value="warm-bell">温暖铃声</option>
             <option value="glass">玻璃轻响</option>
@@ -74,13 +75,13 @@
       <label class="field volume-field">
         <span>内置音效音量 <output id="soundVolumeValue">系统控制</output></span>
         <input id="soundVolume" type="range" min="0" max="1" step="0.05">
-        <small>选择 Windows 默认通知声时，音量由 Windows 的系统声音设置控制，请用下方“测试通知”试听。</small>
+        <small id="systemSoundHint">选择系统默认通知声时，声音由操作系统和浏览器控制，请用下方测试通知试听。</small>
       </label>
 
       <label class="row">
         <span>
           <strong>保留系统通知</strong>
-          <small>要求 Edge 让通知持续显示，直到你处理或系统收纳</small>
+          <small>请求浏览器尽量保留通知；实际显示时长由操作系统通知设置决定</small>
         </span>
         <input id="persistentNotification" type="checkbox">
       </label>
@@ -109,7 +110,7 @@
       <button id="testButton" class="primary" type="button">🔔 测试所选通知通道</button>
       <button id="openButton" type="button">打开 ChatGPT</button>
     </div>
-    <button id="openNotificationSettings" class="full-secondary" type="button">检查 Edge 系统通知策略</button>
+    <button id="openNotificationSettings" class="full-secondary" type="button">打开浏览器通知设置</button>
 
     <footer>
       <span id="saveStatus">设置会自动保存</span>

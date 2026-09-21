@@ -23,6 +23,13 @@ STATIC_RELEASE_ROOT_FILES = (
     "Install-Or-Update-Current-Edge.cmd",
     "Open-Windows-Notification-Settings.cmd",
 )
+MACOS_RELEASE_ROOT_FILES = (
+    "INSTALL-MACOS.md",
+    "CHANGELOG.md",
+    "PRIVACY.md",
+    "THIRD_PARTY_NOTICES.md",
+    "LICENSE",
+)
 
 def release_root_files(version: str) -> tuple[str, ...]:
     return (*STATIC_RELEASE_ROOT_FILES, f"VERIFICATION-{version}.txt")
@@ -109,6 +116,28 @@ def build_release_zip(root: Path, dist: Path, version: str) -> Path:
     return output
 
 
+def build_macos_release_zip(root: Path, dist: Path, version: str) -> Path:
+    read_manifest(root, version)
+    output = dist / f"TurnBell-{version}-macOS.zip"
+    prefix = f"TurnBell-{version}-macOS"
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        for name in MACOS_RELEASE_ROOT_FILES:
+            source = root / name
+            if not source.is_file():
+                raise ValueError(f"missing macOS release file: {source}")
+            add_file(archive, source, f"{prefix}/{name}")
+        verification = root / f"VERIFICATION-{version}.txt"
+        if not verification.is_file():
+            raise ValueError(f"missing release file: {verification}")
+        add_file(archive, verification, f"{prefix}/{verification.name}")
+        add_bytes(archive, f"{prefix}/VERSION.txt", f"{version}\n".encode("utf-8"))
+        extension_root = root / "extension"
+        for source in iter_files(extension_root, RUNTIME_EXCLUDED_PARTS):
+            relative = source.relative_to(extension_root).as_posix()
+            add_file(archive, source, f"{prefix}/extension/{relative}")
+    return output
+
+
 def build_project_zip(root: Path, dist: Path, version: str) -> Path:
     read_manifest(root, version)
     output = dist / f"TurnBell-{version}-project.zip"
@@ -123,7 +152,8 @@ def build_project_zip(root: Path, dist: Path, version: str) -> Path:
 def write_checksums(dist: Path, artifacts: list[Path]) -> Path:
     output = dist / "SHA256SUMS.txt"
     rows = [f"{sha256(path)}  {path.name}" for path in sorted(artifacts, key=lambda item: item.name)]
-    output.write_text("\n".join(rows) + "\n", encoding="utf-8", newline="\n")
+    with output.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write("\n".join(rows) + "\n")
     return output
 
 
@@ -133,11 +163,13 @@ def build_all(root: Path, dist: Path, version: str) -> dict[str, Path]:
     dist.mkdir(parents=True, exist_ok=True)
     extension = build_extension_zip(root, dist, version)
     release = build_release_zip(root, dist, version)
+    macos = build_macos_release_zip(root, dist, version)
     project = build_project_zip(root, dist, version)
-    checksums = write_checksums(dist, [extension, release, project])
+    checksums = write_checksums(dist, [extension, release, macos, project])
     return {
         "extension": extension,
         "release": release,
+        "macos": macos,
         "project": project,
         "checksums": checksums,
     }

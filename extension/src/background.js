@@ -312,13 +312,14 @@ async function showBrowserNotification(payload, settings) {
       id: null,
       permission,
       diagnostic: 'permission-denied',
-      error: 'Edge extension notification permission is denied.',
+      error: 'Browser extension notification permission is denied.',
     };
   }
 
   const tabPart = Number.isInteger(payload.tabId) ? payload.tabId : 'unknown';
   const notificationId = String(payload.notificationId || `${NOTIFICATION_PREFIX}${tabPart}-${Date.now()}`);
   const result = await new Promise((resolve) => {
+    // Chromium routes this extension API to macOS Notification Center on macOS.
     chrome.notifications.create(notificationId, {
       type: 'basic',
       iconUrl: chrome.runtime.getURL('assets/icons/icon-128.png'),
@@ -342,7 +343,7 @@ async function showBrowserNotification(payload, settings) {
       id: null,
       permission,
       diagnostic: 'create-failed',
-      error: result.error || 'Edge did not accept the notification.',
+      error: result.error || 'The browser did not accept the notification.',
     };
   }
 
@@ -711,10 +712,17 @@ function openChatGPT(tabId) {
   chrome.tabs.create({ url: 'https://chatgpt.com/' });
 }
 
-function openEdgeNotificationSettings() {
+function browserNotificationSettingsUrl() {
+  const userAgent = String(globalThis.navigator?.userAgent || '');
+  return /\bEdg\//u.test(userAgent)
+    ? 'edge://settings/content/notifications'
+    : 'chrome://settings/content/notifications';
+}
+
+function openBrowserNotificationSettings() {
   return new Promise((resolve) => {
     try {
-      chrome.tabs.create({ url: 'edge://policy' }, () => {
+      chrome.tabs.create({ url: browserNotificationSettingsUrl() }, () => {
         resolve({ ok: !chrome.runtime.lastError, error: chrome.runtime.lastError?.message || '' });
       });
     } catch (error) {
@@ -826,8 +834,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'open-chatgpt':
         openChatGPT(sender?.tab?.id);
         return { ok: true };
-      case 'open-edge-notification-settings':
-        return openEdgeNotificationSettings();
+      case 'open-browser-notification-settings':
+        return openBrowserNotificationSettings();
       default:
         return { ok: false, error: 'unknown-message' };
     }

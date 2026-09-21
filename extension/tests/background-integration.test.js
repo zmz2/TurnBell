@@ -234,7 +234,7 @@ function domCandidate(turnKey = 'turn-1', overrides = {}) {
   };
 }
 
-test('a final DOM turn uses the Windows default notification sound and sets a badge', async () => {
+test('a final DOM turn uses the system default notification sound and sets a badge', async () => {
   const h = createHarness();
   await h.sendRuntimeMessage({ type: 'turn-start', turnKey: 'turn-1', userCount: 1, at: 10_000 });
   const response = await h.sendRuntimeMessage(domCandidate());
@@ -256,7 +256,7 @@ test('a final DOM turn uses the Windows default notification sound and sets a ba
   assert.equal(h.badgeCalls.some((item) => item.type === 'text' && item.tabId === 42 && item.text === '✓'), true);
 });
 
-test('a selected custom theme mutes the Windows notification sound and plays only the local audio', async () => {
+test('a selected custom theme mutes the system notification sound and plays only the local audio', async () => {
   const h = createHarness({ sound: true, soundTheme: 'glass' });
   await h.sendRuntimeMessage({ type: 'turn-start', turnKey: 'turn-custom', userCount: 1, at: 10_000, source: 'explicit' });
   const response = await h.sendRuntimeMessage(domCandidate('turn-custom'));
@@ -309,7 +309,7 @@ test('background-only setting uses actual tab and window focus', async () => {
   assert.equal(background.notifications.length, 1);
 });
 
-test('test notification returns verifiable Edge diagnostics and sound preview uses the chosen theme', async () => {
+test('test notification returns browser diagnostics and sound preview uses the chosen theme', async () => {
   const h = createHarness();
   const tested = await h.sendRuntimeMessage({
     type: 'test-notification',
@@ -346,11 +346,11 @@ test('settle check keeps the message channel alive until it samples the hidden t
   assert.equal(h.tabMessages[0].message.settleKey, '3:a:b:c');
 });
 
-test('notification diagnostics shortcut opens Edge policy page without native code', async () => {
+test('notification settings shortcut opens the active browser settings page', async () => {
   const h = createHarness();
-  const response = await h.sendRuntimeMessage({ type: 'open-edge-notification-settings' }, {});
+  const response = await h.sendRuntimeMessage({ type: 'open-browser-notification-settings' }, {});
   assert.equal(response.ok, true);
-  assert.equal(h.createdTabs.at(-1).url, 'edge://policy');
+  assert.equal(h.createdTabs.at(-1).url, 'chrome://settings/content/notifications');
 });
 
 test('Web Notification compatibility backend bypasses chrome.notifications routing', async () => {

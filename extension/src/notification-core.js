@@ -9,7 +9,7 @@
   }
 }(typeof globalThis !== 'undefined' ? globalThis : this, function notificationFactory() {
   const SOUND_THEMES = Object.freeze({
-    system: Object.freeze({ label: 'Windows 默认通知声', file: null, system: true }),
+    system: Object.freeze({ label: '系统默认通知声', file: null, system: true }),
     'soft-chime': Object.freeze({ label: '柔和双音', file: 'soft-chime.wav' }),
     'warm-bell': Object.freeze({ label: '温暖铃声', file: 'warm-bell.wav' }),
     glass: Object.freeze({ label: '玻璃轻响', file: 'glass.wav' }),

@@ -1,0 +1,12 @@
+TurnBell 1.6.0 Release Record
+Date: 2026-09-21
+
+Scope
+- Add a separate macOS Chromium extension package and macOS installation guide.
+- Keep notifications on the browser extension API, which Chrome documents as using the native macOS notification system.
+- Make system notification and sound guidance adapt to the current browser and platform.
+
+Validation status
+- Automated tests and a live browser notification were not run for this change.
+- macOS notification banners, sound, lock replay, and Microsoft Edge presentation have not been verified on a physical Mac.
+- The extension remains a Manifest V3 package with no native helper or executable.

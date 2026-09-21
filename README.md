@@ -1,11 +1,11 @@
 # TurnBell
 
-TurnBell 是一个本地、隐私优先的 Chromium 扩展：当 ChatGPT 的一轮新回复真正完成后，发送 Windows 系统通知、可选提示音，并在工具栏显示完成徽标。
+TurnBell 是一个本地、隐私优先的 Chromium 扩展：当 ChatGPT 的一轮新回复真正完成后，通过浏览器的系统通知通道提醒，并在工具栏显示完成徽标。Windows 使用系统通知；macOS 上的 Chrome 扩展通知由 macOS 通知中心显示。
 
-**无需 EXE，不启动本地端口，不更换 Edge 配置，不读取 Cookie，不上传对话。**
+**无需 EXE、原生辅助程序或本地端口，不更换浏览器配置，不读取 Cookie，不上传对话。**
 
-> 当前版本：**1.5.3**
-> 1.5.0 基础功能实机测试：**Windows + Microsoft Edge / Google Chrome**。1.5.3 漏报修复与锁屏补发通过自动化回归，尚待当前设备真实对话验证。
+> 当前版本：**1.6.0**
+> Windows 已完成实机使用验证。1.6.0 增加 macOS 通知中心支持和独立安装包；当前尚未完成 macOS 实机验证。
 
 <p align="center">
   <img src="docs/images/notification-demo.webp" alt="TurnBell 完成通知效果示意" width="900">
@@ -23,15 +23,16 @@ TurnBell 是一个本地、隐私优先的 Chromium 扩展：当 ChatGPT 的一�
 - 刷新已有对话时只建立历史基线，不为旧回答误发通知。
 - 忽略推理摘要、搜索进度、工具状态和仍在变化的中间内容。
 - 每个检测到的用户轮次最多提醒一次，抑制重复完成信号。
-- 支持 Windows 默认通知声和五种本地提示音。
-- 支持 Edge / Chrome 扩展通知 API 与 Web Notification 兼容通道。
+- 支持 Windows 系统通知和 macOS 通知中心。
+- 系统默认通知声跟随操作系统和浏览器设置，也可使用五种本地提示音。
+- 支持 Chromium 扩展通知 API 与 Web Notification 兼容通道。
 - 全部处理在本机完成，无遥测、广告和远程 JavaScript。
 
 ## 快速安装
 
 ### 1. 下载并解压
 
-在本仓库页面点击绿色 **Code** 按钮，选择 **Download ZIP**，然后完整解压下载的 `TurnBell-main.zip`。
+在 GitHub 仓库页面点击绿色 **Code** 按钮，选择 **Download ZIP**，然后完整解压。若使用单独的系统版本包，按对应安装文档操作。
 
 不要直接在压缩包预览窗口中加载扩展。
 
@@ -51,29 +52,30 @@ chrome://extensions/
 
 ### 3. 加载扩展
 
-#### Microsoft Edge
+#### macOS 上的 Microsoft Edge 或 Google Chrome
+
+1. 打开 `edge://extensions/` 或 `chrome://extensions/`；
+2. 开启 **开发人员模式**；
+3. 点击 **加载解压缩的扩展** / **加载未打包的扩展程序**；
+4. 选择解压目录中的 `extension` 文件夹。macOS 版本包中它位于 `TurnBell-1.6.0-macOS/extension`。
+
+详细步骤和 macOS 通知权限设置见 [INSTALL-MACOS.md](INSTALL-MACOS.md)。
+
+#### Windows 上的 Microsoft Edge
 
 1. 打开页面左下角的 **开发人员模式**；
 2. 点击右上角的 **加载解压缩的扩展**；
-3. 选择解压目录中的：
-
-```text
-TurnBell-main\extension
-```
+3. 选择下载并解压后的 TurnBell 文件夹中的 `extension` 子文件夹。
 
 <p align="center">
   <img src="docs/images/edge-install.webp" alt="在 Microsoft Edge 中加载 TurnBell" width="950">
 </p>
 
-#### Google Chrome
+#### Windows 上的 Google Chrome
 
 1. 打开页面右上角的 **开发者模式**；
 2. 点击左上角的 **加载未打包的扩展程序**；
-3. 选择解压目录中的：
-
-```text
-TurnBell-main\extension
-```
+3. 选择下载并解压后的 TurnBell 文件夹中的 `extension` 子文件夹。
 
 <p align="center">
   <img src="docs/images/chrome-install.png" alt="在 Google Chrome 中加载 TurnBell" width="1200">
@@ -85,7 +87,7 @@ TurnBell-main\extension
 2. 刷新已经打开的 ChatGPT 标签页；
 3. 打开 TurnBell 弹窗；
 4. 点击 **测试所选通知通道**；
-5. 保持默认的 **Windows 默认通知声（推荐）**，或选择一个本地音效。
+5. 保持默认的系统通知声，或选择一个本地音效。
 
 更新旧版本时，在对应浏览器的扩展管理页中点击 TurnBell 卡片上的 **重新加载**，然后刷新所有 ChatGPT 标签页。请确保只安装一个 TurnBell 实例，避免重复提醒。
 
@@ -100,13 +102,13 @@ TurnBell-main\extension
 主要设置包括：
 
 - 系统通知通道；
-- Windows 默认通知声或内置音效；
+- 系统默认通知声或内置音效；
 - 保留系统通知；
 - 仅后台标签页提醒；
 - 静默确认时间；
 - 最短生成时间。
 
-## 已完成的真实测试
+## 平台支持与真实测试
 
 目前已在 **Windows + Microsoft Edge** 与 **Windows + Google Chrome** 上进行了实机使用测试，并确认以下场景可用：
 
@@ -118,13 +120,16 @@ TurnBell-main\extension
 - 连续多轮对话分别提醒；
 - Windows 系统通知；
 - Chrome 扩展系统通知；
-- Windows 默认通知声；
+- Windows 系统默认通知声；
 - 自定义本地音效；
 - 每轮重复信号抑制。
 
+1.6.0 中，macOS 的通知使用 Chromium `chrome.notifications` 扩展 API。Chrome 在 macOS 上会把该 API 的通知交给 macOS 原生通知系统；TurnBell 默认选择的正是这个通道。具体说明见 [Chrome 扩展通知文档](https://developer.chrome.com/blog/native-mac-os-notifications)。
+
 尚未完成实机验证的环境包括：
 
-- macOS、Linux；
+- macOS 上的真实通知展示和声音；
+- Linux；
 - Brave、Vivaldi 等其他 Chromium 浏览器；
 - InPrivate / Chrome 无痕模式；
 - 受学校、公司或组织策略管理的 Edge / Chrome。
@@ -174,11 +179,11 @@ TurnBell 只在扩展的 `ISOLATED` world 中观察页面已经显示的 DOM 状
 权限用途：
 
 ```text
-notifications  创建 Edge 系统通知
+notifications  通过浏览器请求操作系统通知
 storage        保存本地设置和短期去重状态
 offscreen      仅在选择自定义音效时播放扩展包内 WAV
 scripting      给更新前已打开的 ChatGPT 标签页补注入本地脚本
-idle           判断系统是否锁屏，以便在解锁后补发完成通知
+idle           判断系统空闲/锁屏状态，以便在恢复活动后补发完成通知
 ```
 
 站点权限仅限：
@@ -190,9 +195,9 @@ https://chat.openai.com/*
 
 详细说明见 [PRIVACY.md](PRIVACY.md)。
 
-## 系统通知排障
+## Windows 系统通知排障
 
-若测试按钮显示 Edge 已接受通知，但 Windows 没有显示横幅：
+若测试按钮显示浏览器已接受通知，但 Windows 没有显示横幅：
 
 1. 按 `Win + N` 检查通知中心；
 2. 检查 Windows“请勿打扰”；
@@ -200,7 +205,7 @@ https://chat.openai.com/*
 4. 尝试切换 TurnBell 的另一个通知通道；
 5. 检查 Windows 音量混合器中的 Edge。
 
-纯扩展不能绕过 Windows、Edge 或组织通知策略。完整排障见 [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md)。
+纯扩展不能绕过 Windows、浏览器或组织通知策略。Windows 排障见 [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md)；macOS 排障见 [INSTALL-MACOS.md](INSTALL-MACOS.md)。
 
 ## 开发与测试
 
@@ -228,5 +233,4 @@ docs/images/        README 使用的安装与界面图片
 
 代码及 TurnBell 原创图标、内置音效采用 [MIT License](LICENSE)。第三方名称、商标和文档截图说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-TurnBell 是非官方独立项目，与 OpenAI 或 Microsoft 无隶属、赞助、认证或合作关系。`ChatGPT`、`OpenAI`、`Microsoft`、`Windows` 和 `Microsoft Edge` 等名称仅用于准确说明兼容对象与测试环境，相关商标归各自权利人所有。
-
+TurnBell 是非官方独立项目，与 OpenAI、Microsoft、Google 或 Apple 无隶属、赞助、认证或合作关系。`ChatGPT`、`Microsoft Edge`、`Google Chrome`、`Windows` 和 `macOS` 等名称仅用于说明兼容对象或界面，相关商标归各自权利人所有。

@@ -254,7 +254,7 @@ test(`history stays silent and regular/Instant replies notify with settings chan
   page.generating = false;
   page.finalAction = true;
   context.document.visibilityState = 'visible';
-  documentListeners.get('visibilitychange')();
+  if (!settingsChange) documentListeners.get('visibilitychange')();
   runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
   now = 22_000;
   runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});

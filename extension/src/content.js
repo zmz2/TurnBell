@@ -337,6 +337,12 @@
   function sample() {
     try {
       resetForNavigation();
+      // A frozen page can resume before its queued visibilitychange handler.
+      // Detect the transition here as well so its first sample stays silent.
+      const hidden = document.visibilityState !== 'visible';
+      if (wasHidden && !hidden) resumedFromBackground = true;
+      if (hidden) resumedFromBackground = false;
+      wasHidden = hidden;
       let snapshot = snapshotForCycle();
       const bootstrap = bootstrapGate.evaluate({
         now: snapshot.now,

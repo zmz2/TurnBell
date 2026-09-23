@@ -72,6 +72,8 @@
   let lastDetectorCycle = 0;
   let pendingIntent = null;
   let currentPath = location.pathname;
+  let wasHidden = document.visibilityState !== 'visible';
+  let resumedFromBackground = false;
 
   function log(...args) {
     if (settings.debug) console.debug('[TurnBell]', ...args);
@@ -151,9 +153,10 @@
       // are still mounting. Live requests are armed by explicit UI intent or a
       // visible generation state instead.
       allowImplicitStart: false,
-      // Instant-style replies can finish without exposing the usual action row.
-      // The detector applies this only to explicitly armed, never-generating turns.
+      // Some background renders omit the final action row, even after a visible
+      // generation state. Such turns require a longer stable period.
       allowActionlessFinal: true,
+      allowGeneratingActionlessFinal: document.visibilityState !== 'visible',
     };
   }
 
@@ -268,16 +271,22 @@
     const actionlessEligible = (
       snapshot.hasFinalAction !== true
       && state.explicitlyArmed === true
-      && state.sawGenerating !== true
+      && (!state.sawGenerating || snapshot.allowGeneratingActionlessFinal)
     );
-    const targetQuiet = actionlessEligible ? actionlessQuiet : standardQuiet;
+    const generatingActionlessQuiet = Number(state.options?.generatingActionlessQuietPeriodMs)
+      || Math.max(8_000, standardQuiet);
+    const targetQuiet = actionlessEligible
+      ? (state.sawGenerating ? generatingActionlessQuiet : actionlessQuiet)
+      : standardQuiet;
     const stableSince = Math.max(
       Number(state.lastAssistantChangeAt) || Number(state.settleStartedAt) || snapshot.now,
       Number(state.settleStartedAt) || Number(state.lastAssistantChangeAt) || snapshot.now,
     );
     const elapsed = Math.max(0, snapshot.now - stableSince);
     return {
-      mode: actionlessEligible ? 'instant-actionless' : 'standard',
+      mode: actionlessEligible
+        ? (state.sawGenerating ? 'generating-actionless' : 'instant-actionless')
+        : 'standard',
       delayMs: Math.max(200, targetQuiet - elapsed),
     };
   }
@@ -345,6 +354,26 @@
         log('historical DOM accepted as silent baseline', bootstrap.reason);
         return;
       }
+      if (resumedFromBackground) {
+        resumedFromBackground = false;
+        const priorState = detector.getState();
+        const replyChanged = snapshot.assistantText !== priorState.baselineAssistantText
+          || snapshot.assistantCount > priorState.baselineAssistantCount;
+        if (priorState.phase !== 'idle' && !snapshot.isGenerating && replyChanged) {
+          // The page may have deferred DOM updates until it was foregrounded.
+          // A completed reply first discovered on return is already visible to
+          // the user, so it must not produce a late background notification.
+          detector.reset();
+          detector.step(snapshot);
+          lastDetectorCycle = detector.getState().cycleNumber;
+          currentTurnKey = '';
+          lastSentTurnKey = '';
+          lastSettleKey = '';
+          pendingIntent = null;
+          log('suppressed completion first observed on foreground resume');
+          return;
+        }
+      }
       const event = detector.step(snapshot);
       const state = detector.getState();
       handleCycleTransition(snapshot, state);
@@ -358,7 +387,7 @@
           log('candidate rejected: final action disappeared before confirmation');
           return;
         }
-        if (finalEvidence === 'explicit-fast-stable') {
+        if (finalEvidence === 'explicit-fast-stable' || finalEvidence === 'explicit-generating-stable') {
           const sameReply = snapshot.fingerprint && snapshot.fingerprint === String(event.fingerprint || '');
           if (snapshot.isGenerating || !sameReply) {
             log('candidate rejected: fast fallback changed before confirmation');
@@ -429,7 +458,13 @@
     bootstrapGate.noteMutation(Date.now());
     scheduleSample(0);
     pollTimer = globalThis.setInterval(sample, POLL_INTERVAL_MS);
-    document.addEventListener('visibilitychange', () => scheduleSample(0));
+    document.addEventListener('visibilitychange', () => {
+      const hidden = document.visibilityState !== 'visible';
+      if (wasHidden && !hidden) resumedFromBackground = true;
+      if (hidden) resumedFromBackground = false;
+      wasHidden = hidden;
+      scheduleSample(0);
+    });
     document.addEventListener('submit', () => noteUserIntent('submit'), true);
     document.addEventListener('keydown', (event) => {
       if (event?.key !== 'Enter' || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
@@ -454,7 +489,7 @@
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     switch (message?.type) {
       case 'monitor-ping':
-        sendResponse({ ok: true, active: true, version: '1.6.0', mode: 'dom-only' });
+        sendResponse({ ok: true, active: true, version: '1.6.1', mode: 'dom-only' });
         return false;
       case 'monitor-sample-now': {
         const state = detector.getState();

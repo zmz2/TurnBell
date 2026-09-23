@@ -13,6 +13,7 @@ function snapshot({
   isFinalRenderable = true,
   allowImplicitStart = true,
   allowActionlessFinal = false,
+  allowGeneratingActionlessFinal = false,
 } = {}) {
   return {
     now,
@@ -23,6 +24,7 @@ function snapshot({
     isFinalRenderable,
     allowImplicitStart,
     allowActionlessFinal,
+    allowGeneratingActionlessFinal,
   };
 }
 
@@ -386,7 +388,7 @@ test('late hydrated history cannot arm a cycle when implicit DOM starts are disa
   assert.equal(d.getState().phase, 'idle');
 });
 
-test('actionless fallback never completes a cycle that exposed a generating state', () => {
+test('a generating cycle waits through a reasoning recap and accepts the final action row', () => {
   const d = detector({ quietPeriodMs: 300, actionlessQuietPeriodMs: 1_000 });
 
   d.step(snapshot({ now: 0, assistantText: 'old', userCount: 1 }));
@@ -430,4 +432,45 @@ test('actionless fallback never completes a cycle that exposed a generating stat
   }));
   assert.equal(final?.type, 'complete');
   assert.equal(final?.finalEvidence, 'final-action');
+});
+
+test('an explicitly started generating cycle completes without an action row after a longer stable period', () => {
+  const d = detector({
+    quietPeriodMs: 300,
+    actionlessQuietPeriodMs: 1_000,
+    generatingActionlessQuietPeriodMs: 8_000,
+  });
+  d.step(snapshot({ now: 0, assistantText: 'old answer', userCount: 1 }));
+  d.arm(snapshot({ now: 100, assistantText: 'old answer', userCount: 1 }));
+  d.step(snapshot({ now: 200, isGenerating: true, assistantText: 'partial answer', userCount: 2,
+    isFinalRenderable: false, allowActionlessFinal: true, allowGeneratingActionlessFinal: true,
+    allowImplicitStart: false }));
+  d.step(snapshot({ now: 1_000, assistantText: 'finished answer', userCount: 2,
+    isFinalRenderable: false, allowActionlessFinal: true, allowGeneratingActionlessFinal: true,
+    allowImplicitStart: false }));
+  assert.equal(d.step(snapshot({ now: 8_999, assistantText: 'finished answer', userCount: 2,
+    isFinalRenderable: false, allowActionlessFinal: true, allowGeneratingActionlessFinal: true,
+    allowImplicitStart: false })), null);
+  const event = d.step(snapshot({ now: 9_000, assistantText: 'finished answer', userCount: 2,
+    isFinalRenderable: false, allowActionlessFinal: true, allowGeneratingActionlessFinal: true,
+    allowImplicitStart: false }));
+  assert.equal(event?.finalEvidence, 'explicit-generating-stable');
+  assert.equal(event?.hasFinalAction, false);
+  assert.equal(d.step(snapshot({ now: 10_000, assistantText: 'finished answer', userCount: 2,
+    isFinalRenderable: false, allowActionlessFinal: true, allowGeneratingActionlessFinal: true,
+    allowImplicitStart: false })), null);
+});
+
+test('the generating actionless fallback stays disabled in a visible tab', () => {
+  const d = detector({ quietPeriodMs: 300, generatingActionlessQuietPeriodMs: 8_000 });
+  d.step(snapshot({ now: 0, assistantText: 'old answer', userCount: 1 }));
+  d.arm(snapshot({ now: 100, assistantText: 'old answer', userCount: 1 }));
+  d.step(snapshot({ now: 200, isGenerating: true, assistantText: 'partial', userCount: 2,
+    isFinalRenderable: false, allowActionlessFinal: true, allowImplicitStart: false }));
+  d.step(snapshot({ now: 1_000, assistantText: 'answer', userCount: 2,
+    isFinalRenderable: false, allowActionlessFinal: true, allowImplicitStart: false }));
+  assert.equal(d.step(snapshot({ now: 20_000, assistantText: 'answer', userCount: 2,
+    isFinalRenderable: false, allowActionlessFinal: true, allowImplicitStart: false })), null);
+  assert.equal(d.step(snapshot({ now: 20_300, assistantText: 'answer', userCount: 2,
+    isFinalRenderable: true, allowActionlessFinal: true, allowImplicitStart: false }))?.finalEvidence, 'final-action');
 });

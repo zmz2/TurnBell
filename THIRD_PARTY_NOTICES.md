@@ -36,4 +36,4 @@ The TurnBell application icon and the following bundled WAV files were created s
 
 ## Dependencies
 
-TurnBell 1.6.0 has no third-party JavaScript runtime dependencies and does not load remote JavaScript.
+TurnBell 1.6.1 has no third-party JavaScript runtime dependencies and does not load remote JavaScript.

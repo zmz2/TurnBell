@@ -1,6 +1,6 @@
 # TurnBell 隐私说明
 
-版本：1.6.0
+版本：1.6.1
 更新日期：2026-09-21
 
 TurnBell 是一个仅在本机运行的 Chromium 浏览器扩展，用于在 ChatGPT 的新一轮回复出现明确最终完成证据后发出提醒。系统通知由当前浏览器转交操作系统处理；Chrome on macOS 使用 macOS 原生通知系统。
@@ -63,7 +63,7 @@ https://chat.openai.com/*
 
 ## 明确不做的事情
 
-TurnBell 1.6.0：
+TurnBell 1.6.1：
 
 - 不读取或修改 Cookie、令牌、密码和账户凭据；
 - 不拦截、克隆或解析 ChatGPT 网络响应流；

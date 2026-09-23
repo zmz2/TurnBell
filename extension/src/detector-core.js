@@ -11,6 +11,7 @@
   const DEFAULTS = Object.freeze({
     quietPeriodMs: 1_000,
     actionlessQuietPeriodMs: 3_000,
+    generatingActionlessQuietPeriodMs: 8_000,
     minGenerationMs: 500,
     maxWaitMs: 2 * 60 * 60_000,
   });
@@ -28,6 +29,12 @@
       actionlessQuietPeriodMs: clampInteger(
         raw.actionlessQuietPeriodMs,
         Math.max(DEFAULTS.actionlessQuietPeriodMs, quietPeriodMs),
+        quietPeriodMs,
+        60_000,
+      ),
+      generatingActionlessQuietPeriodMs: clampInteger(
+        raw.generatingActionlessQuietPeriodMs,
+        Math.max(DEFAULTS.generatingActionlessQuietPeriodMs, quietPeriodMs),
         quietPeriodMs,
         60_000,
       ),
@@ -115,6 +122,7 @@
         isFinalRenderable: raw.isFinalRenderable !== false,
         allowImplicitStart: raw.allowImplicitStart !== false,
         allowActionlessFinal: raw.allowActionlessFinal === true,
+        allowGeneratingActionlessFinal: raw.allowGeneratingActionlessFinal === true,
       };
     }
 
@@ -214,6 +222,7 @@
         const stableDurationMs = snapshot.now - stableSince;
         const quietEnough = stableDurationMs >= options.quietPeriodMs;
         const actionlessQuietEnough = stableDurationMs >= options.actionlessQuietPeriodMs;
+        const generatingActionlessQuietEnough = stableDurationMs >= options.generatingActionlessQuietPeriodMs;
         const durationMs = Math.max(0, snapshot.now - (state.cycleStartAt ?? snapshot.now));
         const longEnough = durationMs >= options.minGenerationMs;
         const replyChanged = snapshot.assistantText !== state.baselineAssistantText
@@ -222,14 +231,14 @@
 
         if (quietEnough && longEnough) {
           const actionRowFinal = snapshot.isFinalRenderable;
-          const explicitFastFinal = (
+          const explicitActionlessFinal = (
             !actionRowFinal
             && snapshot.allowActionlessFinal
             && state.explicitlyArmed
-            && !state.sawGenerating
-            && actionlessQuietEnough
+            && (!state.sawGenerating || snapshot.allowGeneratingActionlessFinal)
+            && (state.sawGenerating ? generatingActionlessQuietEnough : actionlessQuietEnough)
           );
-          if (!actionRowFinal && !explicitFastFinal) {
+          if (!actionRowFinal && !explicitActionlessFinal) {
             remember(snapshot);
             return null;
           }
@@ -249,7 +258,9 @@
             replyText: snapshot.assistantText,
             fingerprint: fingerprint(snapshot.assistantText),
             hasFinalAction: actionRowFinal,
-            finalEvidence: actionRowFinal ? 'final-action' : 'explicit-fast-stable',
+            finalEvidence: actionRowFinal
+              ? 'final-action'
+              : state.sawGenerating ? 'explicit-generating-stable' : 'explicit-fast-stable',
           };
           clearCycle();
           return event;

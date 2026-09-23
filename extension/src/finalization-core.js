@@ -70,7 +70,7 @@
     const hasFinalAction = event.hasFinalAction === true;
     const finalEvidence = hasFinalAction ? 'final-action' : String(event.finalEvidence || '');
     const trustedActionlessFinal = (
-      finalEvidence === 'explicit-fast-stable'
+      (finalEvidence === 'explicit-fast-stable' || finalEvidence === 'explicit-generating-stable')
       && state.startSource === 'explicit'
     );
     if (!hasFinalAction && !trustedActionlessFinal) {
@@ -78,7 +78,7 @@
         state,
         action: {
           type: 'suppress',
-          reason: finalEvidence === 'explicit-fast-stable'
+          reason: finalEvidence === 'explicit-fast-stable' || finalEvidence === 'explicit-generating-stable'
             ? 'untrusted-actionless-final'
             : 'not-final-render',
         },
@@ -110,7 +110,9 @@
       state,
       action: {
         type: 'notify',
-        source: trustedActionlessFinal ? 'dom-fast-final' : 'dom-final',
+        source: finalEvidence === 'explicit-generating-stable'
+          ? 'dom-generating-stable-final'
+          : trustedActionlessFinal ? 'dom-fast-final' : 'dom-final',
         cycleNumber: state.cycleNumber,
         startedAt: state.startedAt,
         completedAt: at,

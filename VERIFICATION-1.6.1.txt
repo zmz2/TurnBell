@@ -1,0 +1,14 @@
+TurnBell 1.6.1 Release Record
+Date: 2026-09-23
+
+Scope
+- Detect explicitly started ChatGPT replies that finish in a hidden tab without rendering a final action row, after eight seconds of stable text.
+- Suppress a late completion notification when the page first reveals the finished reply after returning to the foreground.
+- Keep the macOS system notification channel on the Chromium extension notification API. No browser setting was changed.
+
+Validation status
+- Unit and content-script lifecycle regression tests passed locally on macOS.
+- Release artifacts were verified for Manifest V3 permissions and integrity.
+- In the user's Edge, the selected extension notification channel was accepted and background-only filtering was disabled.
+- A live end-to-end background reply was not conclusively observed after this code change; the user must reload the extension and refresh ChatGPT tabs to activate it.
+- Edge sleeping tabs can pause page scripts, so no immediate DOM-based completion notification can be guaranteed while a tab is frozen.

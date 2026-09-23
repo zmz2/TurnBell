@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "TurnBell · AI 对话完成提醒",
   "short_name": "TurnBell",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "本地、隐私优先：使用 Windows 系统通知与 macOS 通知中心提醒 ChatGPT 回复完成；无需原生程序。",
   "minimum_chrome_version": "111",
   "permissions": [

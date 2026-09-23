@@ -57,6 +57,26 @@ test('an explicit Instant-style turn accepts stable actionless final evidence', 
   assert.equal(result.state.notified, true);
 });
 
+test('an explicitly started generating turn accepts stable actionless final evidence', () => {
+  const result = acceptDomCandidate(firstTurn('explicit'), {
+    at: 9_000,
+    turnKey: 'turn-1',
+    hasFinalAction: false,
+    finalEvidence: 'explicit-generating-stable',
+    fingerprint: 'finished-answer',
+  });
+  assert.equal(result.action.type, 'notify');
+  assert.equal(result.action.source, 'dom-generating-stable-final');
+  assert.equal(result.state.notified, true);
+  const untrusted = acceptDomCandidate(firstTurn('implicit'), {
+    at: 9_000,
+    turnKey: 'turn-1',
+    hasFinalAction: false,
+    finalEvidence: 'explicit-generating-stable',
+  });
+  assert.equal(untrusted.action.reason, 'untrusted-actionless-final');
+});
+
 test('actionless final evidence is rejected unless the turn was explicitly started', () => {
   const result = acceptDomCandidate(firstTurn('implicit'), {
     at: 4_000,

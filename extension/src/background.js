@@ -754,7 +754,7 @@ async function monitorStatus() {
   return {
     ok: true,
     domListener: true,
-    finalEvidence: 'action-row-or-explicit-instant-stability',
+    finalEvidence: 'action-row-or-explicit-stability',
     privacyMode: 'isolated-world-dom-only',
     nativeExecutableRequired: false,
     ...status,

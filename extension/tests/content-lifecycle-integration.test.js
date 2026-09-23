@@ -207,5 +207,82 @@ test(`history stays silent and regular/Instant replies notify with settings chan
   assert.equal(candidates[1].payload.event.hasFinalAction, false);
   assert.equal(candidates[1].payload.event.finalEvidence, 'explicit-fast-stable');
   assert.equal(JSON.stringify(candidates[1]).includes('instant final answer'), false);
+
+  // A normal generating reply may finish while hidden without mounting its
+  // final action row. After a longer quiet period it must still notify.
+  now = 10_000;
+  documentListeners.get('keydown')({
+    key: 'Enter', shiftKey: false, ctrlKey: false, altKey: false, metaKey: false,
+    isComposing: false, keyCode: 13, target: composer,
+  });
+  now = 10_100;
+  page.userTurns = [...page.userTurns, makeTurn('background question', 'user-background')];
+  page.generating = true;
+  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  now = 10_300;
+  page.assistantTurns = [...page.assistantTurns, makeTurn('partial background answer', 'assistant-background')];
+  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  now = 11_000;
+  page.assistantTurns = [
+    ...page.assistantTurns.slice(0, -1), makeTurn('finished background answer', 'assistant-background'),
+  ];
+  page.generating = false;
+  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  assert.equal(runtimeMessages.filter((message) => message.type === 'schedule-settle-check').at(-1)?.delayMs, 8_000);
+  now = 18_999;
+  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  assert.equal(runtimeMessages.filter((message) => message.type === 'dom-final-candidate').length, 2);
+  now = 19_000;
+  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  candidates = runtimeMessages.filter((message) => message.type === 'dom-final-candidate');
+  assert.equal(candidates.length, 3);
+  assert.equal(candidates[2].payload.event.finalEvidence, 'explicit-generating-stable');
+
+  // If completion is first revealed when the user returns to the page, it
+  // should not create a notification after the reply is already visible.
+  now = 20_000;
+  documentListeners.get('keydown')({
+    key: 'Enter', shiftKey: false, ctrlKey: false, altKey: false, metaKey: false,
+    isComposing: false, keyCode: 13, target: composer,
+  });
+  now = 20_100;
+  page.userTurns = [...page.userTurns, makeTurn('late question', 'user-late')];
+  page.generating = true;
+  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  now = 21_000;
+  page.assistantTurns = [...page.assistantTurns, makeTurn('already finished', 'assistant-late')];
+  page.generating = false;
+  page.finalAction = true;
+  context.document.visibilityState = 'visible';
+  documentListeners.get('visibilitychange')();
+  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  now = 22_000;
+  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  assert.equal(runtimeMessages.filter((message) => message.type === 'dom-final-candidate').length, 3);
+
+  // Returning while generation is still active must preserve the cycle.
+  now = 23_000;
+  documentListeners.get('keydown')({
+    key: 'Enter', shiftKey: false, ctrlKey: false, altKey: false, metaKey: false,
+    isComposing: false, keyCode: 13, target: composer,
+  });
+  now = 23_100;
+  page.userTurns = [...page.userTurns, makeTurn('still running', 'user-running')];
+  page.generating = true;
+  page.finalAction = false;
+  context.document.visibilityState = 'hidden';
+  documentListeners.get('visibilitychange')();
+  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  context.document.visibilityState = 'visible';
+  documentListeners.get('visibilitychange')();
+  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  now = 24_000;
+  page.assistantTurns = [...page.assistantTurns, makeTurn('finished after return', 'assistant-running')];
+  page.generating = false;
+  page.finalAction = true;
+  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  now = 25_300;
+  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  assert.equal(runtimeMessages.filter((message) => message.type === 'dom-final-candidate').length, 4);
 });
 }

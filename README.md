@@ -4,8 +4,8 @@ TurnBell 是一个本地、隐私优先的 Chromium 扩展：当 ChatGPT 的一�
 
 **无需 EXE、原生辅助程序或本地端口，不更换浏览器配置，不读取 Cookie，不上传对话。**
 
-> 当前版本：**1.6.0**
-> Windows 已完成实机使用验证。1.6.0 增加 macOS 通知中心支持和独立安装包；当前尚未完成 macOS 实机验证。
+> 当前版本：**1.6.1**
+> 1.6.1 改进了 macOS / Edge 后台回复完成检测。系统通知通道已在 macOS Edge 上确认可接受测试通知；真实回复完成后的横幅仍需持续实机观察。
 
 <p align="center">
   <img src="docs/images/notification-demo.webp" alt="TurnBell 完成通知效果示意" width="900">
@@ -21,7 +21,7 @@ TurnBell 是一个本地、隐私优先的 Chromium 扩展：当 ChatGPT 的一�
 - 切换到其他 Edge 标签页或其他应用后仍可提醒。
 - 锁屏期间完成的回复会在解锁后重新显示通知。
 - 刷新已有对话时只建立历史基线，不为旧回答误发通知。
-- 忽略推理摘要、搜索进度、工具状态和仍在变化的中间内容。
+- 等待文本稳定与完成信号，减少推理摘要、搜索进度和工具状态的误报。
 - 每个检测到的用户轮次最多提醒一次，抑制重复完成信号。
 - 支持 Windows 系统通知和 macOS 通知中心。
 - 系统默认通知声跟随操作系统和浏览器设置，也可使用五种本地提示音。
@@ -57,7 +57,7 @@ chrome://extensions/
 1. 打开 `edge://extensions/` 或 `chrome://extensions/`；
 2. 开启 **开发人员模式**；
 3. 点击 **加载解压缩的扩展** / **加载未打包的扩展程序**；
-4. 选择解压目录中的 `extension` 文件夹。macOS 版本包中它位于 `TurnBell-1.6.0-macOS/extension`。
+4. 选择解压目录中的 `extension` 文件夹。macOS 版本包中它位于 `TurnBell-1.6.1-macOS/extension`。
 
 详细步骤和 macOS 通知权限设置见 [INSTALL-MACOS.md](INSTALL-MACOS.md)。
 
@@ -124,11 +124,11 @@ chrome://extensions/
 - 自定义本地音效；
 - 每轮重复信号抑制。
 
-1.6.0 中，macOS 的通知使用 Chromium `chrome.notifications` 扩展 API。Chrome 在 macOS 上会把该 API 的通知交给 macOS 原生通知系统；TurnBell 默认选择的正是这个通道。具体说明见 [Chrome 扩展通知文档](https://developer.chrome.com/blog/native-mac-os-notifications)。
+1.6.1 中，macOS 的通知使用 Chromium `chrome.notifications` 扩展 API。Chrome 在 macOS 上会把该 API 的通知交给 macOS 原生通知系统；TurnBell 默认选择的正是这个通道。具体说明见 [Chrome 扩展通知文档](https://developer.chrome.com/blog/native-mac-os-notifications)。
 
 尚未完成实机验证的环境包括：
 
-- macOS 上的真实通知展示和声音；
+- macOS 上真实回复完成后的通知横幅和声音；
 - Linux；
 - Brave、Vivaldi 等其他 Chromium 浏览器；
 - InPrivate / Chrome 无痕模式；
@@ -155,6 +155,10 @@ TurnBell 不通过单一固定超时猜测所有回复完成。正常路径综�
 ```
 
 Instant / “极速”路径可能没有持续可见的生成状态或最终操作栏，因此仅对明确的实时发送动作启用更严格的兼容规则：回答必须相对发送前发生变化，并连续稳定约 3 秒。
+
+1.6.1 增加了后台兼容路径：如果明确发送的回复曾出现生成状态，但后台页面没有呈现最终操作栏，文本连续稳定约 8 秒后也可提醒。若生成按钮消失后的推理摘要长时间不变，这条路径仍有误报可能。切回标签页时才首次看到完成状态，则不补发迟到提醒。
+
+Edge 若休眠标签页，页面脚本会暂停；在不调整浏览器设置的前提下，纯 DOM 扩展无法保证休眠期间即时检测完成。
 
 TurnBell 的语义是**每轮至多一次提醒**，不是严格的 exactly-once。若 Edge 丢弃标签页、ChatGPT 大幅修改页面结构或最终证据不足，扩展可能选择不提醒，而不是把中间过程误报为完成。
 

@@ -30,6 +30,8 @@ test(`history stays silent and regular/Instant replies notify with settings chan
     userTurns: [],
     finalAction: false,
     generating: false,
+    completedTurn: false,
+    turnState: '',
   };
 
   class FakeDate extends Date {
@@ -94,6 +96,8 @@ test(`history stays silent and regular/Instant replies notify with settings chan
       },
       collectAssistantTurns() { return page.assistantTurns; },
       hasFinalActionForTurn() { return page.finalAction; },
+      hasCompletedTurn() { return page.completedTurn; },
+      latestTurnState() { return page.turnState; },
       fingerprint(value) { return detectorAPI.fingerprint(String(value)); },
       makeTurnKey({ pathname, userTurns, assistantCount, cycleNumber }) {
         const latestUser = userTurns.at(-1)?.identity || 'none';
@@ -284,5 +288,37 @@ test(`history stays silent and regular/Instant replies notify with settings chan
   now = 25_300;
   runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
   assert.equal(runtimeMessages.filter((message) => message.type === 'dom-final-candidate').length, 4);
+
+  // The current ChatGPT DOM exposes a lifecycle marker instead of legacy stop
+  // and action controls. Its explicit completion must pass through unchanged.
+  now = 26_000;
+  documentListeners.get('keydown')({
+    key: 'Enter', shiftKey: false, ctrlKey: false, altKey: false, metaKey: false,
+    isComposing: false, keyCode: 13, target: composer,
+  });
+  now = 26_100;
+  page.userTurns = [...page.userTurns, makeTurn('new layout question', 'user-layout')];
+  page.turnState = 'in_progress';
+  page.finalAction = false;
+  context.document.visibilityState = 'hidden';
+  documentListeners.get('visibilitychange')();
+  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  now = 27_000;
+  page.assistantTurns = [...page.assistantTurns, makeTurn('new layout answer', 'assistant-layout')];
+  page.turnState = 'complete';
+  page.completedTurn = true;
+  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  now = 28_300;
+  runtimeListener({ type: 'monitor-sample-now' }, {}, () => {});
+  candidates = runtimeMessages.filter((message) => message.type === 'dom-final-candidate');
+  assert.equal(candidates.length, 5);
+  assert.equal(candidates[4].payload.event.finalEvidence, 'turn-complete');
+  assert.equal(candidates[4].payload.event.hasCompletedTurn, true);
+  assert.equal(candidates[4].payload.event.hasFinalAction, false);
+  let diagnostic;
+  runtimeListener({ type: 'notification-context' }, {}, (response) => { diagnostic = response; });
+  assert.equal(diagnostic.diagnostics.some((entry) => entry.type === 'completion-detected'), true);
+  assert.equal(diagnostic.diagnostics.some((entry) => entry.type === 'notification-result'), true);
+  assert.equal(JSON.stringify(diagnostic.diagnostics).includes('new layout answer'), false);
 });
 }

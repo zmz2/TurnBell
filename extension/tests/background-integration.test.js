@@ -61,6 +61,7 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
   const runtime = {
     id: 'background-test', lastError: null,
     getURL(value) { return `chrome-extension://background-test/${value}`; },
+    getManifest() { return { version: '1.6.2' }; },
     async sendMessage(message) { soundMessages.push(message); return { ok: true }; },
     onInstalled: events.onInstalled, onStartup: events.onStartup, onMessage: events.onMessage,
   };
@@ -119,10 +120,11 @@ function createHarness(settingsOverrides = {}, environmentOverrides = {}) {
       onStateChanged: events.onIdleStateChanged,
     },
     tabs: {
-      query(_query, callback) { callback([]); },
+      query(_query, callback) { callback(environmentOverrides.tabs || []); },
       sendMessage(tabId, message, callback) {
         tabMessages.push({ tabId, message });
-        callback?.({ ok: true, active: true, sampled: true });
+        callback?.(message.type === 'notification-context' && environmentOverrides.tabContext
+          ? environmentOverrides.tabContext : { ok: true, active: true, sampled: true });
       },
       get(tabId, callback) {
         callback({ id: tabId, title: 'Background research - ChatGPT', url: 'https://chatgpt.com/c/background', active: tabActive, windowId: 7 });
@@ -266,6 +268,36 @@ test('a selected custom theme mutes the system notification sound and plays only
   assert.equal(response.routes.systemSound, false);
   assert.equal(response.routes.sound, true);
   assert.equal(h.soundMessages.some((item) => item.type === 'play-sound' && item.theme === 'glass'), true);
+});
+
+test('the current ChatGPT completion marker sends one system notification without action buttons', async () => {
+  const h = createHarness();
+  await h.sendRuntimeMessage({ type: 'turn-start', turnKey: 'new-layout', userCount: 1, at: 10_000 });
+  const candidate = domCandidate('new-layout', {
+    event: { hasFinalAction: false, hasCompletedTurn: true, finalEvidence: 'turn-complete' },
+    context: { hasFinalAction: false, hasCompletedTurn: true },
+  });
+  const response = await h.sendRuntimeMessage(candidate);
+  assert.equal(response.routes.browser, true);
+  assert.equal(h.notifications.length, 1);
+  assert.equal((await h.sendRuntimeMessage(candidate)).reason, 'already-notified');
+});
+
+test('diagnostic export includes detector events without conversation titles or reply text', async () => {
+  const h = createHarness({}, {
+    tabs: [{ id: 42, url: 'https://chatgpt.com/c/background' }],
+    tabContext: {
+      ok: true, version: '1.6.2',
+      snapshot: { phase: 'generating', userCount: 1, assistantCount: 1 },
+      diagnostics: [{ at: 10_000, type: 'turn-start', userCount: 1 }],
+      context: { pageTitle: 'PRIVATE TITLE', assistantText: 'PRIVATE REPLY' },
+    },
+  });
+  const result = await h.sendRuntimeMessage({ type: 'monitor-diagnostics' });
+  assert.equal(result.ok, true);
+  assert.equal(result.report.pages[0].snapshot.phase, 'generating');
+  assert.equal(result.report.pages[0].events[0].type, 'turn-start');
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE TITLE|PRIVATE REPLY/u);
 });
 
 test('duplicate evidence is suppressed, but a new key can recover a missed turn-start', async () => {

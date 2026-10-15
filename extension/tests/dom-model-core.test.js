@@ -76,6 +76,51 @@ test('collectTurns unions layouts, de-duplicates one turn, and preserves documen
   assert.equal(turns[1].container, secondContainer);
 });
 
+test('October ChatGPT search units keep both roles separate inside one lifecycle turn', () => {
+  let state = 'in_progress';
+  const lifecycle = { getAttribute() { return state; } };
+  function unit(role, order, text) {
+    return {
+      order, innerText: text, isConnected: true,
+      getAttribute(name) {
+        if (name === 'data-chatgpt-search-unit-key' || name === 'data-content-search-unit-key') {
+          return `fallback-turn-0:${order}:${role}`;
+        }
+        if (name === 'data-chatgpt-search-message-ids') return `${role}-message-id`;
+        return '';
+      },
+      closest(selector) {
+        if (selector === '[data-talvt-turn-state]') return lifecycle;
+        if (selector === '[data-chatgpt-search-unit-key]' || selector === '[data-content-search-unit-key]') return this;
+        return null;
+      },
+      querySelector() { return null; },
+    };
+  }
+  const user = unit('user', 0, 'question');
+  const assistant = unit('assistant', 2, 'answer');
+  const doc = fakeDocument(new Map([
+    ['[data-chatgpt-search-unit-key$=":user"]', [user]],
+    ['[data-content-search-unit-key$=":user"]', [user]],
+    ['[data-chatgpt-search-unit-key$=":assistant"]', [assistant]],
+    ['[data-content-search-unit-key$=":assistant"]', [assistant]],
+    ['[data-chatgpt-search-unit-key]', [user, assistant]],
+    ['[data-content-search-unit-key]', [user, assistant]],
+    ['[data-talvt-turn-state]', [lifecycle]],
+  ]));
+  const api = require('../src/dom-model-core.js');
+  assert.equal(collectTurns(doc, USER_SELECTORS).length, 1);
+  const replies = api.collectAssistantTurns(doc);
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].text, 'answer');
+  assert.equal(replies[0].identity, 'data-chatgpt-search-message-ids:assistant-message-id');
+  assert.equal(api.hasCompletedTurn(replies[0]), false);
+  assert.equal(api.latestTurnState(doc), 'in_progress');
+  state = 'complete';
+  assert.equal(api.hasCompletedTurn(replies[0]), true);
+  assert.equal(api.latestTurnState(doc), 'complete');
+});
+
 test('final completion accepts several stable action-row controls, not only copy', () => {
   for (const token of [
     'copy-turn-action-button',

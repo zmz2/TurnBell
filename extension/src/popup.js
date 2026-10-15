@@ -24,6 +24,7 @@
   const previewSound = document.getElementById('previewSound');
   const openButton = document.getElementById('openButton');
   const openNotificationSettings = document.getElementById('openNotificationSettings');
+  const copyDiagnostics = document.getElementById('copyDiagnostics');
   const saveStatus = document.getElementById('saveStatus');
   const volumeValue = document.getElementById('soundVolumeValue');
   const platformNotificationHint = document.getElementById('platformNotificationHint');
@@ -284,6 +285,21 @@
     setTimeout(() => { openNotificationSettings.disabled = false; }, 700);
   }
 
+  async function copyMonitorDiagnostics() {
+    copyDiagnostics.disabled = true;
+    try {
+      const result = await sendMessage({ type: 'monitor-diagnostics' });
+      if (!result.ok) throw new Error(result.error);
+      await navigator.clipboard.writeText(JSON.stringify(result.report, null, 2));
+      copyDiagnostics.textContent = '已复制诊断信息';
+    } catch (error) {
+      copyDiagnostics.textContent = '复制失败，请重试';
+      diagnosticStatus.textContent = `读取诊断失败：${error.message}`;
+    } finally {
+      copyDiagnostics.disabled = false;
+    }
+  }
+
   async function initialize() {
     configurePlatformCopy();
     const stored = await storageGet({});
@@ -303,6 +319,7 @@
     previewSound.addEventListener('click', () => void previewSelectedSound());
     openButton.addEventListener('click', () => void sendMessage({ type: 'open-chatgpt' }));
     openNotificationSettings.addEventListener('click', () => void openBrowserSettings());
+    copyDiagnostics.addEventListener('click', () => void copyMonitorDiagnostics());
     void refreshNotificationStatus();
     void refreshMonitorStatus();
   }

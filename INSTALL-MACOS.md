@@ -1,14 +1,14 @@
-# TurnBell 1.6.1：macOS 安装与系统通知设置
+# TurnBell 1.6.2：macOS 安装与系统通知设置
 
 TurnBell 是 Chromium 浏览器扩展，不是独立 Mac App。macOS 版使用浏览器扩展通知 API；Chrome 会把扩展通知交给 macOS 原生通知系统和通知中心，不需要安装 EXE、`.app` 辅助程序、Homebrew 包或本地服务。参考 [Chrome for Developers：macOS 原生通知系统](https://developer.chrome.com/blog/native-mac-os-notifications)。
 
 ## 安装
 
-1. 在 GitHub 仓库页面点击 **Code → Download ZIP** 并完整解压；如果你拿到单独的 `TurnBell-1.6.1-macOS.zip`，也可以使用该版本包。
+1. 在 GitHub 仓库页面点击 **Code → Download ZIP** 并完整解压；如果你拿到单独的 `TurnBell-1.6.2-macOS.zip`，也可以使用该版本包。
 2. 在 Google Chrome 打开 `chrome://extensions/`，或在 Microsoft Edge 打开 `edge://extensions/`。
 3. 开启页面上的 **开发人员模式**。
 4. 点击 **加载未打包的扩展程序**（Edge 中显示为 **加载解压缩的扩展**）。
-5. 选择解压目录中的 `extension` 文件夹；如果下载的是 macOS 发布包，它位于 `TurnBell-1.6.1-macOS/extension`。
+5. 选择解压目录中的 `extension` 文件夹；如果下载的是 macOS 发布包，它位于 `TurnBell-1.6.2-macOS/extension`。
 6. 将 TurnBell 固定到工具栏，然后刷新已经打开的 ChatGPT 标签页。
 
 更新时，在扩展管理页点击 TurnBell 卡片上的 **重新加载**，再刷新已打开的 ChatGPT 标签页。请只安装一个 TurnBell 实例，避免重复提醒。
@@ -41,7 +41,7 @@ TurnBell 每轮最多提醒一次。回答仍在变化、最终完成证据不�
 - 没有系统默认声音：检查 TurnBell 的提示音开关、macOS 中浏览器的通知声音设置和系统音量；内置音效可用 **试听** 单独检查。
 - 测试通知没有被接受：在扩展管理页确认 TurnBell 已启用且权限可用，重新加载扩展，再次打开 ChatGPT 标签页。
 - Edge 或其他 Chromium 浏览器：通知系统接入由浏览器决定；TurnBell 已针对 Chromium 扩展 API 适配，但 macOS 实机验证仍需在目标浏览器上完成。
-- 如果切回 ChatGPT 后才看到回复完成，说明页面可能直到切回时才更新。1.6.1 会跳过这种迟到提醒。若 Edge 将标签页休眠，扩展无法在页面脚本暂停期间观察 DOM；不修改 Edge 设置时无法保证休眠中的即时提醒。
+- 如果切回 ChatGPT 后才看到回复完成，说明页面可能直到切回时才更新。1.6.2 会跳过这种迟到提醒。若 Edge 将标签页休眠，扩展无法在页面脚本暂停期间观察 DOM；不修改 Edge 设置时无法保证休眠中的即时提醒。
 
 ## 兼容范围
 

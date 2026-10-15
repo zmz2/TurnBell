@@ -14,6 +14,8 @@
     '[data-author="assistant"]',
     '[data-testid^="conversation-turn-"] [data-message-author-role="assistant"]',
     'article [data-message-author-role="assistant"]',
+    '[data-chatgpt-search-unit-key$=":assistant"]',
+    '[data-content-search-unit-key$=":assistant"]',
   ]);
 
   const USER_SELECTORS = Object.freeze([
@@ -22,6 +24,8 @@
     '[data-author="user"]',
     '[data-testid^="conversation-turn-"] [data-message-author-role="user"]',
     'article [data-message-author-role="user"]',
+    '[data-chatgpt-search-unit-key$=":user"]',
+    '[data-content-search-unit-key$=":user"]',
   ]);
 
   const FINAL_ACTION_SELECTORS = Object.freeze([
@@ -43,6 +47,8 @@
   ]);
 
   const TURN_CONTAINER_SELECTORS = Object.freeze([
+    '[data-chatgpt-search-unit-key]',
+    '[data-content-search-unit-key]',
     'article[data-testid^="conversation-turn-"]',
     '[data-testid^="conversation-turn-"]',
     'article[data-turn]',
@@ -84,7 +90,7 @@
   function identityOf(element, container = turnContainer(element)) {
     for (const candidate of [element, container]) {
       if (!candidate?.getAttribute) continue;
-      for (const name of ['data-message-id', 'id', 'data-testid']) {
+      for (const name of ['data-message-id', 'data-chatgpt-search-message-ids', 'id', 'data-testid']) {
         const value = normalizeText(candidate.getAttribute(name), 180);
         if (value) return `${name}:${value}`;
       }
@@ -146,6 +152,11 @@
 
   function roleFromContainer(container) {
     if (!container) return '';
+    for (const name of ['data-chatgpt-search-unit-key', 'data-content-search-unit-key']) {
+      const key = container.getAttribute?.(name) || '';
+      if (key.endsWith(':assistant')) return 'assistant';
+      if (key.endsWith(':user')) return 'user';
+    }
     for (const name of ['data-message-author-role', 'data-author', 'data-turn']) {
       const value = normalizeText(container.getAttribute?.(name), 40).toLowerCase();
       if (value === 'assistant' || value === 'user') return value;
@@ -231,6 +242,17 @@
       }
     }
     return false;
+  }
+
+  function latestTurnState(documentObject) {
+    const turns = documentObject.querySelectorAll('[data-talvt-turn-state]');
+    return turns.length ? turns[turns.length - 1].getAttribute('data-talvt-turn-state') : '';
+  }
+
+  function hasCompletedTurn(turn) {
+    const container = turn?.container;
+    if (!container) return false;
+    return container.closest('[data-talvt-turn-state]')?.getAttribute('data-talvt-turn-state') === 'complete';
   }
 
   function closestKnownTurnContainer(element) {
@@ -323,6 +345,8 @@
     fingerprint,
     hasFinalAction,
     hasFinalActionForTurn,
+    latestTurnState,
+    hasCompletedTurn,
     identityOf,
     makeTurnKey,
     normalizeText,

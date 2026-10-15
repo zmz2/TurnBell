@@ -1,0 +1,15 @@
+TurnBell 1.6.2 Release Record
+Date: 2026-10-15
+
+Observed issue
+- The user's macOS Edge ran 1.6.1 and accepted manually requested system notifications.
+- Nine responding ChatGPT pages all reported zero user and assistant messages. Ten saved reply cycles had never reached the notified state.
+- The actual page DOM uses data-chatgpt-search-unit-key / data-content-search-unit-key message units and data-talvt-turn-state lifecycle markers, absent from the old selectors.
+
+Validation
+- After updating the installed unpacked extension, existing pages reported nonzero message counts and explicit complete / in_progress states.
+- In a dedicated background ChatGPT test tab, a controlled DOM replay transitioned from in_progress to complete. The actual content script emitted turn-complete, the service worker marked the turn notified, and chrome.notifications returned accepted-active with system sound enabled.
+- This was a controlled page-DOM replay, not a successfully completed live model request. The new ChatGPT page remained in account/profile loading with sending unavailable during the live request attempt.
+- Automated tests cover the new message layout, separate user/assistant units, completion marker propagation, once-only system notification, and diagnostic export privacy.
+- All 93 extension tests passed; release ZIPs passed layout, permissions, CRC, and SHA-256 verification.
+- Browser sleeping-tab settings and macOS notification settings were not changed.

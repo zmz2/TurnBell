@@ -74,8 +74,15 @@
   let currentPath = location.pathname;
   let wasHidden = document.visibilityState !== 'visible';
   let resumedFromBackground = false;
+  const diagnosticEvents = [];
+
+  function recordDiagnostic(type, details = {}) {
+    diagnosticEvents.push({ at: Date.now(), type, ...details });
+    if (diagnosticEvents.length > 30) diagnosticEvents.shift();
+  }
 
   function log(...args) {
+    recordDiagnostic(args[0]);
     if (settings.debug) console.debug('[TurnBell]', ...args);
   }
 
@@ -131,15 +138,19 @@
     const finalAction = typeof domAPI.hasFinalActionForTurn === 'function'
       ? domAPI.hasFinalActionForTurn(document, latestAssistant, domAPI.FINAL_ACTION_SELECTORS)
       : domAPI.hasFinalAction(latestAssistant?.container, domAPI.FINAL_ACTION_SELECTORS);
+    const completedTurn = domAPI.hasCompletedTurn?.(latestAssistant) === true;
+    const turnState = domAPI.latestTurnState?.(document) || '';
     const assistantText = latestAssistant?.text || '';
     return {
       now: Date.now(),
-      isGenerating: isGenerating(),
+      isGenerating: (turnState !== '' && turnState !== 'complete') || isGenerating(),
       assistantText,
       assistantCount: assistantTurns.length,
       userCount: userTurns.length,
-      isFinalRenderable: finalAction,
+      isFinalRenderable: finalAction || completedTurn,
       hasFinalAction: finalAction,
+      hasCompletedTurn: completedTurn,
+      turnState,
       assistantTurns,
       userTurns,
       turnKey: domAPI.makeTurnKey({
@@ -168,6 +179,9 @@
       userCount: snapshot.userCount,
       isFinalRenderable: snapshot.isFinalRenderable,
       hasFinalAction: snapshot.hasFinalAction,
+      hasCompletedTurn: snapshot.hasCompletedTurn,
+      turnState: snapshot.turnState,
+      phase: detector.getState().phase,
       turnKey: currentTurnKey || snapshot.turnKey || '',
       fingerprint: snapshot.fingerprint,
     };
@@ -182,6 +196,7 @@
       userCount: snapshot.userCount,
       isGenerating: snapshot.isGenerating,
       hasFinalAction: snapshot.hasFinalAction,
+      hasCompletedTurn: snapshot.hasCompletedTurn,
       turnKey: currentTurnKey || snapshot.turnKey || '',
       fingerprint: snapshot.fingerprint,
     };
@@ -205,6 +220,7 @@
     currentTurnKey = key;
     if (key === lastSentTurnKey) return;
     lastSentTurnKey = key;
+    recordDiagnostic('turn-start', { source, userCount });
     sendRuntimeMessage({
       type: 'turn-start',
       turnKey: key,
@@ -257,10 +273,18 @@
           completedAt: Number(event.completedAt) || snapshot.now,
           fingerprint: String(event.fingerprint || snapshot.fingerprint || ''),
           hasFinalAction: snapshot.hasFinalAction === true,
+          hasCompletedTurn: snapshot.hasCompletedTurn === true,
           finalEvidence: String(event.finalEvidence || (snapshot.hasFinalAction ? 'final-action' : '')),
         },
         context: pageContext(snapshot),
       },
+    }, (response) => {
+      recordDiagnostic('notification-result', {
+        ok: response?.ok === true,
+        reason: response?.reason || '',
+        browser: response?.routes?.browser === true,
+        web: response?.routes?.web === true,
+      });
     });
   }
 
@@ -269,7 +293,7 @@
     const actionlessQuiet = Number(state.options?.actionlessQuietPeriodMs)
       || Math.max(3_000, standardQuiet);
     const actionlessEligible = (
-      snapshot.hasFinalAction !== true
+      snapshot.isFinalRenderable !== true
       && state.explicitlyArmed === true
       && (!state.sawGenerating || snapshot.allowGeneratingActionlessFinal)
     );
@@ -380,15 +404,29 @@
           return;
         }
       }
+      const previousPhase = detector.getState().phase;
       const event = detector.step(snapshot);
       const state = detector.getState();
+      if (state.phase !== previousPhase) {
+        recordDiagnostic('phase', {
+          phase: state.phase, turnState: snapshot.turnState,
+          users: snapshot.userCount, assistants: snapshot.assistantCount,
+        });
+      }
       handleCycleTransition(snapshot, state);
 
       if (event) {
+        recordDiagnostic('completion-detected', { evidence: event.finalEvidence });
         lastSettleKey = '';
         // Refresh once: action controls can be inserted in the same render batch.
         snapshot = snapshotForCycle(state.cycleNumber);
         const finalEvidence = String(event.finalEvidence || '');
+        if (finalEvidence === 'turn-complete') {
+          if (!snapshot.hasCompletedTurn || snapshot.isGenerating || snapshot.fingerprint !== event.fingerprint) {
+            log('candidate rejected: completed turn changed before confirmation');
+            return;
+          }
+        }
         if (finalEvidence === 'final-action' && !snapshot.hasFinalAction) {
           log('candidate rejected: final action disappeared before confirmation');
           return;
@@ -399,7 +437,7 @@
             log('candidate rejected: fast fallback changed before confirmation');
             return;
           }
-        } else if (!snapshot.hasFinalAction) {
+        } else if (!snapshot.hasFinalAction && finalEvidence !== 'turn-complete') {
           log('candidate rejected: no trusted final evidence');
           return;
         }
@@ -436,6 +474,10 @@
         'data-message-id',
         'data-message-author-role',
         'data-turn',
+        'data-chatgpt-search-unit-key',
+        'data-content-search-unit-key',
+        'data-chatgpt-search-message-ids',
+        'data-talvt-turn-state',
         'disabled',
         'hidden',
       ],
@@ -495,7 +537,7 @@
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     switch (message?.type) {
       case 'monitor-ping':
-        sendResponse({ ok: true, active: true, version: '1.6.1', mode: 'dom-only' });
+        sendResponse({ ok: true, active: true, version: '1.6.2', mode: 'dom-only' });
         return false;
       case 'monitor-sample-now': {
         const state = detector.getState();
@@ -509,7 +551,7 @@
       }
       case 'notification-context': {
         const snapshot = snapshotForCycle();
-        sendResponse({ ok: true, snapshot: publicSnapshot(snapshot), context: pageContext(snapshot) });
+        sendResponse({ ok: true, version: '1.6.2', snapshot: publicSnapshot(snapshot), context: pageContext(snapshot), diagnostics: [...diagnosticEvents] });
         return false;
       }
       default:

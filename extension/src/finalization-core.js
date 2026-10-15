@@ -68,12 +68,14 @@
   function acceptDomCandidate(rawState, event = {}) {
     let state = ensureState(rawState, event);
     const hasFinalAction = event.hasFinalAction === true;
-    const finalEvidence = hasFinalAction ? 'final-action' : String(event.finalEvidence || '');
+    const hasCompletedTurn = event.hasCompletedTurn === true;
+    const finalEvidence = hasCompletedTurn ? 'turn-complete'
+      : hasFinalAction ? 'final-action' : String(event.finalEvidence || '');
     const trustedActionlessFinal = (
       (finalEvidence === 'explicit-fast-stable' || finalEvidence === 'explicit-generating-stable')
       && state.startSource === 'explicit'
     );
-    if (!hasFinalAction && !trustedActionlessFinal) {
+    if (!hasFinalAction && !hasCompletedTurn && !trustedActionlessFinal) {
       return {
         state,
         action: {
@@ -110,7 +112,8 @@
       state,
       action: {
         type: 'notify',
-        source: finalEvidence === 'explicit-generating-stable'
+        source: hasCompletedTurn ? 'dom-turn-complete'
+          : finalEvidence === 'explicit-generating-stable'
           ? 'dom-generating-stable-final'
           : trustedActionlessFinal ? 'dom-fast-final' : 'dom-final',
         cycleNumber: state.cycleNumber,

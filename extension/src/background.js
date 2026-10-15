@@ -662,6 +662,7 @@ async function handleDomCandidate(message, sender) {
     turnKey: String(message.turnKey || context.turnKey || ''),
     userCount: Number(context.userCount) || 0,
     hasFinalAction,
+    hasCompletedTurn: event.hasCompletedTurn === true || context.hasCompletedTurn === true,
     finalEvidence: String(event.finalEvidence || (hasFinalAction ? 'final-action' : '')),
     fingerprint: String(event.fingerprint || context.fingerprint || ''),
   }));
@@ -761,6 +762,39 @@ async function monitorStatus() {
   };
 }
 
+async function monitorDiagnostics() {
+  const tabs = await tabMonitor.queryMatchingTabs();
+  const store = await loadFinalizationStore();
+  const pages = await Promise.all(tabs.map(async (tab) => {
+    let timer;
+    const response = await Promise.race([
+      sendTabMessage(tab.id, { type: 'notification-context' }),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), 2_000); }),
+    ]);
+    clearTimeout(timer);
+    const turn = store[String(tab.id)];
+    return {
+      tabId: tab.id,
+      version: response?.version || null,
+      responding: response?.ok === true,
+      snapshot: response?.snapshot || null,
+      events: response?.diagnostics || [],
+      lastTurn: turn ? { startedAt: turn.startedAt, notified: turn.notified } : null,
+    };
+  }));
+  const items = await sessionGet({ [LAST_DIAGNOSTIC_KEY]: null });
+  return {
+    ok: true,
+    report: {
+      version: chrome.runtime.getManifest().version,
+      at: Date.now(),
+      settings: await getSettings(),
+      notification: items[LAST_DIAGNOSTIC_KEY],
+      pages,
+    },
+  };
+}
+
 async function removeTabState(tabId) {
   await mutateFinalization(tabId, () => ({ state: null, action: { type: 'removed' } }));
 }
@@ -831,6 +865,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case 'monitor-status':
         return monitorStatus();
+      case 'monitor-diagnostics':
+        return monitorDiagnostics();
       case 'open-chatgpt':
         openChatGPT(sender?.tab?.id);
         return { ok: true };

@@ -14,6 +14,7 @@ function nextTurn() { return new Promise((resolve) => setImmediate(resolve)); }
 function makeContainer(order, final = false) {
   return {
     order,
+    closest() { return null; },
     getAttribute(name) { return name === 'data-testid' ? `conversation-turn-${order}` : ''; },
     querySelector(selector) {
       return final && selector.includes('copy-turn-action-button') ? { isConnected: true } : null;

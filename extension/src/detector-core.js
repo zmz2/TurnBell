@@ -120,6 +120,7 @@
         assistantCount: count(raw.assistantCount),
         userCount: count(raw.userCount),
         isFinalRenderable: raw.isFinalRenderable !== false,
+        hasCompletedTurn: raw.hasCompletedTurn === true,
         allowImplicitStart: raw.allowImplicitStart !== false,
         allowActionlessFinal: raw.allowActionlessFinal === true,
         allowGeneratingActionlessFinal: raw.allowGeneratingActionlessFinal === true,
@@ -257,9 +258,10 @@
             completedAt: snapshot.now,
             replyText: snapshot.assistantText,
             fingerprint: fingerprint(snapshot.assistantText),
-            hasFinalAction: actionRowFinal,
+            hasFinalAction: actionRowFinal && !snapshot.hasCompletedTurn,
+            hasCompletedTurn: snapshot.hasCompletedTurn,
             finalEvidence: actionRowFinal
-              ? 'final-action'
+              ? (snapshot.hasCompletedTurn ? 'turn-complete' : 'final-action')
               : state.sawGenerating ? 'explicit-generating-stable' : 'explicit-fast-stable',
           };
           clearCycle();
